@@ -492,6 +492,48 @@ You have access to a suite of tools, some running on a remote Gateway and some l
 Use them seamlessly to assist the user.
 """
 
+def invoke_bedrock_agent_runtime(prompt_text, session_id):
+    """
+    Invoke managed Bedrock Agent Runtime using agent and alias IDs from env.
+    Returns response text, or None if Bedrock agent env is not configured.
+    """
+    agent_id = (os.getenv("BEDROCK_AGENT_ID") or "").strip()
+    agent_alias_id = (os.getenv("BEDROCK_AGENT_ALIAS_ID") or "").strip()
+    region = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+
+    if not agent_id or not agent_alias_id:
+        logger.info("BEDROCK_AGENT_ID / BEDROCK_AGENT_ALIAS_ID not set; skipping managed Bedrock Agent invocation.")
+        return None
+
+    logger.info(f"Invoking Bedrock Agent Runtime: agent_id={agent_id}, alias_id={agent_alias_id}, region={region}")
+    runtime = boto3.client("bedrock-agent-runtime", region_name=region)
+    response = runtime.invoke_agent(
+        agentId=agent_id,
+        agentAliasId=agent_alias_id,
+        sessionId=session_id,
+        inputText=prompt_text
+    )
+
+    completion_text = []
+    for event in response.get("completion", []):
+        chunk = event.get("chunk")
+        if chunk and "bytes" in chunk:
+            raw = chunk["bytes"]
+            if isinstance(raw, (bytes, bytearray)):
+                completion_text.append(raw.decode("utf-8", errors="ignore"))
+            else:
+                completion_text.append(str(raw))
+
+    final_text = "".join(completion_text).strip()
+    if final_text:
+        return final_text
+
+    # If control was returned by an action group, surface that state for debugging.
+    if "returnControl" in response:
+        return f"Bedrock agent returned control: {json.dumps(response.get('returnControl'))}"
+
+    return "No response content returned by Bedrock Agent Runtime."
+
 @app.entrypoint
 async def migration_assistant(payload):
     """
@@ -549,28 +591,27 @@ Current User Input:
         CURRENT_IMAGE_CONTEXT["payload"] = None
 
     try:
-        # Define Tools
-        all_tools = [
-            cost_assistant,
-            aws_docs_assistant, 
-            vpc_subnet_calculator,
-            hld_lld_input_agent,
-            arch_diag_assistant
-        ]
-        
-        # Instantiate Agent
-        migration_agent = Agent(
-            model="us.anthropic.claude-3-7-sonnet-20250219-v1:0",
-            system_prompt=migration_system_prompt,
-            tools=all_tools
-            # Removed hooks=[session_memory_provider]
-        )
-
-        # Run Agent
+        # Primary path: managed Bedrock Agent Runtime (created by Terraform)
         loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(None, migration_agent, user_input)
-        
-        response_text = response.message['content'][0]['text']
+        response_text = await loop.run_in_executor(None, invoke_bedrock_agent_runtime, user_input, session_id)
+
+        # Fallback path: local Strands orchestration if Bedrock Agent env is not configured
+        if not response_text:
+            logger.warning("Falling back to local Strands agent execution.")
+            all_tools = [
+                cost_assistant,
+                aws_docs_assistant, 
+                vpc_subnet_calculator,
+                hld_lld_input_agent,
+                arch_diag_assistant
+            ]
+            migration_agent = Agent(
+                model="us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+                system_prompt=migration_system_prompt,
+                tools=all_tools
+            )
+            response = await loop.run_in_executor(None, migration_agent, user_input)
+            response_text = response.message['content'][0]['text']
         
         # 2. Save Interaction to Memory
         add_to_memory(session_id, "user", original_user_input)
