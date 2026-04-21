@@ -4,6 +4,7 @@ import asyncio
 import time
 import logging
 import json
+from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
@@ -507,12 +508,16 @@ def invoke_bedrock_agent_runtime(prompt_text, session_id):
 
     logger.info(f"Invoking Bedrock Agent Runtime: agent_id={agent_id}, alias_id={agent_alias_id}, region={region}")
     runtime = boto3.client("bedrock-agent-runtime", region_name=region)
-    response = runtime.invoke_agent(
-        agentId=agent_id,
-        agentAliasId=agent_alias_id,
-        sessionId=session_id,
-        inputText=prompt_text
-    )
+    try:
+        response = runtime.invoke_agent(
+            agentId=agent_id,
+            agentAliasId=agent_alias_id,
+            sessionId=session_id,
+            inputText=prompt_text
+        )
+    except ClientError as e:
+        logger.error(f"InvokeAgent API call failed: {e}")
+        return None
 
     completion_text = []
     for event in response.get("completion", []):
@@ -523,6 +528,24 @@ def invoke_bedrock_agent_runtime(prompt_text, session_id):
                 completion_text.append(raw.decode("utf-8", errors="ignore"))
             else:
                 completion_text.append(str(raw))
+            continue
+
+        # Surface Bedrock event-stream exceptions.
+        for key in [
+            "accessDeniedException",
+            "badGatewayException",
+            "conflictException",
+            "dependencyFailedException",
+            "internalServerException",
+            "modelNotReadyException",
+            "resourceNotFoundException",
+            "serviceQuotaExceededException",
+            "throttlingException",
+            "validationException"
+        ]:
+            if key in event:
+                logger.error(f"InvokeAgent stream error [{key}]: {event.get(key)}")
+                return None
 
     final_text = "".join(completion_text).strip()
     if final_text:
@@ -597,7 +620,7 @@ Current User Input:
 
         # Fallback path: local Strands orchestration if Bedrock Agent env is not configured
         if not response_text:
-            logger.warning("Falling back to local Strands agent execution.")
+            logger.warning("Falling back to local Strands agent execution (Bedrock Agent Runtime unavailable).")
             all_tools = [
                 cost_assistant,
                 aws_docs_assistant, 
