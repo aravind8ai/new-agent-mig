@@ -332,7 +332,7 @@ def arch_diag_assistant(payload):
         bedrock_client = boto3.client('bedrock-runtime', region_name='us-east-1')
         
         agent = Agent(
-            model="us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+            model="us.amazon.nova-pro-v1:0",
             tools=diagram_tools,
             system_prompt="""You are a Senior AWS Solutions Architect.
             Create professional AWS architecture diagrams.
@@ -629,7 +629,7 @@ Current User Input:
                 arch_diag_assistant
             ]
             migration_agent = Agent(
-                model="us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+                model="us.amazon.nova-pro-v1:0",
                 system_prompt=migration_system_prompt,
                 tools=all_tools
             )
