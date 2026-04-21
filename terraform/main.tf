@@ -248,7 +248,7 @@ resource "aws_iam_role_policy" "ecs_task_inline" {
       },
       {
         Effect   = "Allow"
-        Action   = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
+        Action   = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream", "bedrock:InvokeAgent"]
         Resource = "*"
       },
       {

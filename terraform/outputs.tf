@@ -2,7 +2,7 @@ output "vpc_id" {
 
   description = "ID of the VPC created for the agent stack"
 
-  value       = aws_vpc.main.id
+  value = aws_vpc.main.id
 }
 
 output "public_subnet_ids" {

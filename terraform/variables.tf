@@ -60,7 +60,7 @@ variable "public_subnet_cidrs" {
   default     = ["10.50.1.0/24", "10.50.2.0/24"]
 
   validation {
-    condition     = length(var.public_subnet_cidrs) >= 2
+    condition = length(var.public_subnet_cidrs) >= 2
 
 
     error_message = "Provide at least two public subnet CIDRs for the ALB."
