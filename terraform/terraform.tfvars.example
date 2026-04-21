@@ -7,6 +7,7 @@ bedrock_agent_alias_name               = "prod"
 bedrock_tools_action_group_name        = "migration-tools"
 bedrock_idle_session_ttl_in_seconds    = 900
 
+
 vpc_cidr            = "10.50.0.0/16"
 public_subnet_cidrs = ["10.50.1.0/24", "10.50.2.0/24"]
 
@@ -14,5 +15,5 @@ public_subnet_cidrs = ["10.50.1.0/24", "10.50.2.0/24"]
 gateway_url = ""
 
 container_image_tag  = "latest"
-desired_count        = 1
+desired_count        = 0
 force_new_deployment = false

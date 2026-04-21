@@ -1,5 +1,7 @@
 output "vpc_id" {
-  description = "ID of the VPC created for this stack"
+
+  description = "ID of the VPC created for the agent stack"
+
   value       = aws_vpc.main.id
 }
 
@@ -16,6 +18,10 @@ output "bedrock_agent_id" {
 output "bedrock_agent_alias_id" {
   description = "Created Bedrock Agent Alias ID (null if disabled)"
   value       = var.create_bedrock_agent ? aws_bedrockagent_agent_alias.migration[0].agent_alias_id : null
+}
+
+  description = "Public subnet IDs used by ALB and ECS"
+  value       = aws_subnet.public[*].id
 }
 
 output "ecr_repository_url" {

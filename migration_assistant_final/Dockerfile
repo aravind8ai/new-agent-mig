@@ -1,61 +1,50 @@
-# Stage 1: Build Frontend
+# Stage 1: Build frontend assets
 FROM --platform=$BUILDPLATFORM node:22-slim AS frontend-build
 WORKDIR /app
+
 COPY frontend/package*.json ./
-RUN npm ci
+RUN npm ci --no-audit
+
 ARG VITE_APP_TITLE
-ENV VITE_APP_TITLE=$VITE_APP_TITLE
 ARG VITE_COGNITO_USER_POOL_ID
-ENV VITE_COGNITO_USER_POOL_ID=$VITE_COGNITO_USER_POOL_ID
 ARG VITE_COGNITO_CLIENT_ID
+ENV VITE_APP_TITLE=$VITE_APP_TITLE
+ENV VITE_COGNITO_USER_POOL_ID=$VITE_COGNITO_USER_POOL_ID
 ENV VITE_COGNITO_CLIENT_ID=$VITE_COGNITO_CLIENT_ID
-# Strict memory limit for 1GB container
 ENV NODE_OPTIONS="--max-old-space-size=768"
+
 COPY frontend/ .
 RUN npm run build
 
-# Stage 2: Backend
+# Stage 2: Build Python virtual environment
+FROM python:3.11-slim AS pydeps
+WORKDIR /opt
 
-FROM python:3.13-slim
+COPY backend/requirements.pip requirements.txt
+RUN python -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
+    && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt \
+    && /opt/venv/bin/pip install --no-cache-dir uv
 
+# Stage 3: Runtime image
+FROM python:3.11-slim
 WORKDIR /app
 
-# Install system dependencies
-# Nginx for proxying, Supervisor for process management
-RUN apt-get update && apt-get install -y \
-    curl \
-    git \
-    nginx \
-    supervisor \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nginx supervisor \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv (via pip is easiest)
-RUN pip install --no-cache-dir uv
+COPY --from=pydeps /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+ENV PYTHONUNBUFFERED=1
 
-# Copy requirements
-COPY backend/requirements.pip requirements.txt
-
-# Install python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy application code
 COPY backend/migration_agent.py .
 COPY backend/gateway_infra_utils.py .
-
-
-# Copy frontend build
 COPY --from=frontend-build /app/dist ./static
 
-# Configure Nginx & Supervisor
-# Remove default symlink if exists and copy our config
 RUN rm -f /etc/nginx/sites-enabled/default
 COPY backend/nginx.conf /etc/nginx/sites-enabled/default
 COPY backend/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
-# Expose port 8000 (Nginx)
 EXPOSE 8000
-
-ENV PYTHONUNBUFFERED=1
-
-# Command to run Supervisor (which runs Nginx + Python)
 CMD ["/usr/bin/supervisord"]

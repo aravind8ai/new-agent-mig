@@ -46,6 +46,7 @@ variable "bedrock_tools_action_group_name" {
   default     = "migration-tools"
 }
 
+
 variable "vpc_cidr" {
   description = "CIDR block for the new VPC"
   type        = string
@@ -53,13 +54,16 @@ variable "vpc_cidr" {
 }
 
 variable "public_subnet_cidrs" {
-  description = "CIDR blocks for public subnets (minimum 2 for ALB)"
+
+  description = "CIDR blocks for public subnets (use at least two in different AZs for ALB)"
   type        = list(string)
   default     = ["10.50.1.0/24", "10.50.2.0/24"]
 
   validation {
     condition     = length(var.public_subnet_cidrs) >= 2
-    error_message = "Provide at least two subnet CIDRs for public_subnet_cidrs."
+
+
+    error_message = "Provide at least two public subnet CIDRs for the ALB."
   }
 }
 
@@ -88,9 +92,9 @@ variable "task_memory" {
 }
 
 variable "desired_count" {
-  description = "Desired ECS task count"
+  description = "Desired ECS task count (set to 0 for infra-first bootstrap, then scale to 1 after image push)"
   type        = number
-  default     = 1
+  default     = 0
 }
 
 variable "log_retention_days" {

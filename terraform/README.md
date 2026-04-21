@@ -3,8 +3,10 @@
 This Terraform stack provisions:
 
 - New VPC, Internet Gateway, public route table, and public subnets
+
 - Amazon Bedrock Agent + Alias (optional toggle)
 - Bedrock Agent Action Group wired to the tools Lambda
+
 - Tools Lambda (`<app_name>-tools`)
 - S3 bucket for diagrams (`<app_name>-diagrams-<account_id>`) with 1-day lifecycle on `diagrams/`
 - ECR repository for the app image
@@ -34,6 +36,9 @@ After apply, push the app image to ECR (use output `ecr_repository_url`) and tri
 cd ../migration_assistant_final
 ./deploy.sh
 ```
+
+`desired_count` defaults to `0` for infra-first bootstrap (to avoid ECS pull failures before an image exists).  
+`deploy.sh` scales the ECS service to `DESIRED_COUNT` (default `1`) after pushing the image.
 
 Access the app using output `app_url` (ALB DNS over HTTP).
 
