@@ -364,9 +364,7 @@ resource "aws_iam_role_policy" "bedrock_agent" {
           "bedrock:InvokeModel",
           "bedrock:InvokeModelWithResponseStream"
         ]
-        Resource = [
-          "arn:${data.aws_partition.current.partition}:bedrock:${data.aws_region.current.name}::foundation-model/${var.bedrock_foundation_model}"
-        ]
+        Resource = "*"
       },
       {
         Effect = "Allow"
@@ -403,6 +401,17 @@ resource "aws_lambda_permission" "bedrock_agent_tools" {
   source_arn     = "arn:${data.aws_partition.current.partition}:bedrock:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:agent/${aws_bedrockagent_agent.migration[0].agent_id}"
 }
 
+resource "aws_lambda_permission" "bedrock_agent_tools_alias" {
+  count = var.create_bedrock_agent ? 1 : 0
+
+  statement_id   = "AllowBedrockAgentAliasInvokeTools"
+  action         = "lambda:InvokeFunction"
+  function_name  = aws_lambda_function.tools.function_name
+  principal      = "bedrock.amazonaws.com"
+  source_account = data.aws_caller_identity.current.account_id
+  source_arn     = "arn:${data.aws_partition.current.partition}:bedrock:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:agent-alias/${aws_bedrockagent_agent.migration[0].agent_id}/*"
+}
+
 resource "aws_bedrockagent_agent_action_group" "tools" {
   count = var.create_bedrock_agent ? 1 : 0
 
@@ -420,7 +429,10 @@ resource "aws_bedrockagent_agent_action_group" "tools" {
     payload = local.bedrock_tools_openapi_schema
   }
 
-  depends_on = [aws_lambda_permission.bedrock_agent_tools]
+  depends_on = [
+    aws_lambda_permission.bedrock_agent_tools,
+    aws_lambda_permission.bedrock_agent_tools_alias
+  ]
 }
 
 resource "aws_bedrockagent_agent_alias" "migration" {
