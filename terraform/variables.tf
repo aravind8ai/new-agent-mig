@@ -19,7 +19,7 @@ variable "create_bedrock_agent" {
 variable "bedrock_foundation_model" {
   description = "Foundation model for Bedrock Agent orchestration"
   type        = string
-  default     = "us.anthropic.claude-3-7-sonnet-20250219-v1:0"
+  default     = "arn:aws:bedrock:us-east-1:470226123391:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0"
 }
 
 variable "bedrock_agent_instruction" {
