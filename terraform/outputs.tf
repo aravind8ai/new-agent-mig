@@ -1,3 +1,23 @@
+output "vpc_id" {
+  description = "ID of the VPC created for this stack"
+  value       = aws_vpc.main.id
+}
+
+output "public_subnet_ids" {
+  description = "Public subnet IDs used by ALB/ECS"
+  value       = aws_subnet.public[*].id
+}
+
+output "bedrock_agent_id" {
+  description = "Created Bedrock Agent ID (null if disabled)"
+  value       = var.create_bedrock_agent ? aws_bedrockagent_agent.migration[0].agent_id : null
+}
+
+output "bedrock_agent_alias_id" {
+  description = "Created Bedrock Agent Alias ID (null if disabled)"
+  value       = var.create_bedrock_agent ? aws_bedrockagent_agent_alias.migration[0].agent_alias_id : null
+}
+
 output "ecr_repository_url" {
   description = "ECR repository URL to push the container image"
   value       = aws_ecr_repository.app.repository_url

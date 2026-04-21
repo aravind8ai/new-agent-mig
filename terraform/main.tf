@@ -21,15 +21,10 @@ data "aws_caller_identity" "current" {}
 
 data "aws_region" "current" {}
 
-data "aws_vpc" "default" {
-  default = true
-}
+data "aws_partition" "current" {}
 
-data "aws_subnets" "default" {
-  filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.default.id]
-  }
+data "aws_availability_zones" "available" {
+  state = "available"
 }
 
 locals {
@@ -51,6 +46,84 @@ locals {
   image_uri           = "${aws_ecr_repository.app.repository_url}:${var.container_image_tag}"
   lambda_source_file  = "${path.module}/../migration_assistant_final/backend/tools_lambda.py"
   lambda_output_zip   = "${path.module}/tools_lambda.zip"
+  bedrock_tools_openapi_schema = jsonencode({
+    openapi = "3.0.1"
+    info = {
+      title   = "MigrationTools"
+      version = "1.0.0"
+    }
+    paths = {
+      "/cost-assistant" = {
+        post = {
+          operationId = "cost_assistant"
+          description = "Returns AWS pricing guidance for a service payload."
+          requestBody = {
+            required = true
+            content = {
+              "application/json" = {
+                schema = {
+                  type = "object"
+                  properties = {
+                    payload = { type = "string" }
+                  }
+                  required = ["payload"]
+                }
+              }
+            }
+          }
+          responses = {
+            "200" = { description = "Tool response" }
+          }
+        }
+      }
+      "/aws-docs-assistant" = {
+        post = {
+          operationId = "aws_docs_assistant"
+          description = "Returns AWS documentation guidance for a query."
+          requestBody = {
+            required = true
+            content = {
+              "application/json" = {
+                schema = {
+                  type = "object"
+                  properties = {
+                    payload = { type = "string" }
+                  }
+                  required = ["payload"]
+                }
+              }
+            }
+          }
+          responses = {
+            "200" = { description = "Tool response" }
+          }
+        }
+      }
+      "/vpc-subnet-calculator" = {
+        post = {
+          operationId = "vpc_subnet_calculator"
+          description = "Calculates subnet layout for a CIDR block."
+          requestBody = {
+            required = true
+            content = {
+              "application/json" = {
+                schema = {
+                  type = "object"
+                  properties = {
+                    cidr = { type = "string" }
+                  }
+                  required = ["cidr"]
+                }
+              }
+            }
+          }
+          responses = {
+            "200" = { description = "Tool response" }
+          }
+        }
+      }
+    }
+  })
 }
 
 resource "aws_s3_bucket" "diagrams" {
@@ -248,27 +321,182 @@ resource "aws_lambda_function" "tools" {
   depends_on = [aws_iam_role_policy_attachment.tools_lambda_basic]
 }
 
+resource "aws_iam_role" "bedrock_agent" {
+  count = var.create_bedrock_agent ? 1 : 0
+
+  name = "${local.app_name}-bedrock-agent-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "bedrock.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+        Condition = {
+          StringEquals = {
+            "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+          }
+          ArnLike = {
+            "AWS:SourceArn" = "arn:${data.aws_partition.current.partition}:bedrock:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:agent/*"
+          }
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "bedrock_agent" {
+  count = var.create_bedrock_agent ? 1 : 0
+
+  name = "${local.app_name}-bedrock-agent-policy"
+  role = aws_iam_role.bedrock_agent[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "bedrock:InvokeModel",
+          "bedrock:InvokeModelWithResponseStream"
+        ]
+        Resource = [
+          "arn:${data.aws_partition.current.partition}:bedrock:${data.aws_region.current.name}::foundation-model/${var.bedrock_foundation_model}"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "lambda:InvokeFunction"
+        ]
+        Resource = [
+          aws_lambda_function.tools.arn
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_bedrockagent_agent" "migration" {
+  count = var.create_bedrock_agent ? 1 : 0
+
+  agent_name                  = "${local.app_name}-bedrock-agent"
+  agent_resource_role_arn     = aws_iam_role.bedrock_agent[0].arn
+  foundation_model            = var.bedrock_foundation_model
+  instruction                 = var.bedrock_agent_instruction
+  idle_session_ttl_in_seconds = var.bedrock_idle_session_ttl_in_seconds
+  prepare_agent               = true
+}
+
+resource "aws_lambda_permission" "bedrock_agent_tools" {
+  count = var.create_bedrock_agent ? 1 : 0
+
+  statement_id   = "AllowBedrockAgentInvokeTools"
+  action         = "lambda:InvokeFunction"
+  function_name  = aws_lambda_function.tools.function_name
+  principal      = "bedrock.amazonaws.com"
+  source_account = data.aws_caller_identity.current.account_id
+  source_arn     = "arn:${data.aws_partition.current.partition}:bedrock:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:agent/${aws_bedrockagent_agent.migration[0].agent_id}"
+}
+
+resource "aws_bedrockagent_agent_action_group" "tools" {
+  count = var.create_bedrock_agent ? 1 : 0
+
+  agent_id                   = aws_bedrockagent_agent.migration[0].agent_id
+  agent_version              = "DRAFT"
+  action_group_name          = var.bedrock_tools_action_group_name
+  description                = "Lambda-backed toolset for migration assistant"
+  skip_resource_in_use_check = true
+
+  action_group_executor {
+    lambda = aws_lambda_function.tools.arn
+  }
+
+  api_schema {
+    payload = local.bedrock_tools_openapi_schema
+  }
+
+  depends_on = [aws_lambda_permission.bedrock_agent_tools]
+}
+
+resource "aws_bedrockagent_agent_alias" "migration" {
+  count = var.create_bedrock_agent ? 1 : 0
+
+  agent_alias_name = var.bedrock_agent_alias_name
+  agent_id         = aws_bedrockagent_agent.migration[0].agent_id
+  description      = "Alias for ${local.app_name} Bedrock Agent"
+
+  depends_on = [aws_bedrockagent_agent_action_group.tools]
+}
+
 resource "aws_ecs_cluster" "app" {
   name = local.ecs_cluster_name
+}
+
+resource "aws_vpc" "main" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Name = "${local.app_name}-vpc"
+  }
+}
+
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
+
+  tags = {
+    Name = "${local.app_name}-igw"
+  }
+}
+
+resource "aws_subnet" "public" {
+  count = length(var.public_subnet_cidrs)
+
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = var.public_subnet_cidrs[count.index]
+  availability_zone       = element(data.aws_availability_zones.available.names, count.index)
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name = "${local.app_name}-public-${count.index + 1}"
+  }
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  tags = {
+    Name = "${local.app_name}-public-rt"
+  }
+}
+
+resource "aws_route" "public_internet" {
+  route_table_id         = aws_route_table.public.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.main.id
+}
+
+resource "aws_route_table_association" "public" {
+  count = length(var.public_subnet_cidrs)
+
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
 }
 
 resource "aws_security_group" "alb" {
   name        = "${local.app_name}-alb-sg"
   description = "ALB security group"
-  vpc_id      = data.aws_vpc.default.id
+  vpc_id      = aws_vpc.main.id
 
   ingress {
     description = "HTTP"
     from_port   = 80
     to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    description = "HTTPS"
-    from_port   = 443
-    to_port     = 443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
@@ -284,7 +512,7 @@ resource "aws_security_group" "alb" {
 resource "aws_security_group" "ecs" {
   name        = "${local.app_name}-ecs-sg"
   description = "ECS task security group"
-  vpc_id      = data.aws_vpc.default.id
+  vpc_id      = aws_vpc.main.id
 
   ingress {
     description     = "App traffic from ALB"
@@ -307,14 +535,14 @@ resource "aws_lb" "app" {
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]
-  subnets            = data.aws_subnets.default.ids
+  subnets            = aws_subnet.public[*].id
 }
 
 resource "aws_lb_target_group" "app" {
   name        = local.target_group_name
   port        = local.container_port
   protocol    = "HTTP"
-  vpc_id      = data.aws_vpc.default.id
+  vpc_id      = aws_vpc.main.id
   target_type = "ip"
 
   health_check {
@@ -363,6 +591,8 @@ resource "aws_ecs_task_definition" "app" {
         { name = "DIAGRAM_BUCKET_NAME", value = aws_s3_bucket.diagrams.bucket },
         { name = "GATEWAY_URL", value = var.gateway_url },
         { name = "TOOLS_LAMBDA_NAME", value = aws_lambda_function.tools.function_name },
+        { name = "BEDROCK_AGENT_ID", value = var.create_bedrock_agent ? aws_bedrockagent_agent.migration[0].agent_id : "" },
+        { name = "BEDROCK_AGENT_ALIAS_ID", value = var.create_bedrock_agent ? aws_bedrockagent_agent_alias.migration[0].agent_alias_id : "" },
         { name = "AWS_DEFAULT_REGION", value = data.aws_region.current.name }
       ]
       logConfiguration = {
@@ -387,7 +617,7 @@ resource "aws_ecs_service" "app" {
   force_new_deployment = var.force_new_deployment
 
   network_configuration {
-    subnets          = data.aws_subnets.default.ids
+    subnets          = aws_subnet.public[*].id
     security_groups  = [aws_security_group.ecs.id]
     assign_public_ip = true
   }

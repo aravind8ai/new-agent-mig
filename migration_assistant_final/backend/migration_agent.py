@@ -3,6 +3,7 @@ import boto3
 import asyncio
 import time
 import logging
+import json
 from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
@@ -125,7 +126,6 @@ def create_gateway_transport():
 
 from strands import tool
 import base64
-import json
 
 # Global context for image payload (Simple implementation for demo)
 # In production, use ContextVar

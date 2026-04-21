@@ -1,6 +1,15 @@
 aws_region = "us-east-1"
 app_name   = "migration-agent-cloud"
 
+create_bedrock_agent                   = true
+bedrock_foundation_model               = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+bedrock_agent_alias_name               = "prod"
+bedrock_tools_action_group_name        = "migration-tools"
+bedrock_idle_session_ttl_in_seconds    = 900
+
+vpc_cidr            = "10.50.0.0/16"
+public_subnet_cidrs = ["10.50.1.0/24", "10.50.2.0/24"]
+
 # Optional: set this only if your agent uses an external gateway.
 gateway_url = ""
 
