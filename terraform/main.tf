@@ -362,7 +362,9 @@ resource "aws_iam_role_policy" "bedrock_agent" {
         Effect = "Allow"
         Action = [
           "bedrock:InvokeModel",
-          "bedrock:InvokeModelWithResponseStream"
+          "bedrock:InvokeModelWithResponseStream",
+          "bedrock:GetInferenceProfile",
+          "bedrock:ListInferenceProfiles"
         ]
         Resource = "*"
       },
