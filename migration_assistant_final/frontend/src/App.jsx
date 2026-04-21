@@ -1,34 +1,96 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import MessageBubble from './components/Chat/MessageBubble';
 import InputArea from './components/Chat/InputArea';
 import TypingIndicator from './components/Chat/TypingIndicator';
 import './styles/global.css';
 
-// Mock Endpoint - In production, this comes from ENV
-const API_ENDPOINT = import.meta.env.VITE_BACKEND_URL ? `${import.meta.env.VITE_BACKEND_URL}/invocations` : "/invocations";
+const API_ENDPOINT = import.meta.env.VITE_BACKEND_URL
+  ? `${import.meta.env.VITE_BACKEND_URL}/invocations`
+  : '/invocations';
 
-function App() {
+const SESSION_KEY = 'chat_session_id';
+const HISTORY_KEY = 'chat_history';
+
+function getSessionId() {
+  const existing = localStorage.getItem(SESSION_KEY);
+  if (existing) return existing;
+  const created = `session_${Date.now()}`;
+  localStorage.setItem(SESSION_KEY, created);
+  return created;
+}
+
+export default function App() {
   const [messages, setMessages] = useState(() => {
-    const saved = localStorage.getItem('chat_history');
+    const saved = localStorage.getItem(HISTORY_KEY);
     if (saved) return JSON.parse(saved);
-    const appName = import.meta.env.VITE_APP_TITLE || "AWS Migration Assistant";
-    return [{
-      role: 'assistant',
-      content: `Hello! I'm your **${appName}**. \n\nI can help you plan your cloud journey, analyze architecture diagrams, or estimate costs. \n\n*How can I help you today?*`
-    }];
+    const appName = import.meta.env.VITE_APP_TITLE || 'AWS Migration Assistant';
+    return [
+      {
+        role: 'assistant',
+        content: `Hello! I'm your **${appName}**.\n\nI can help you plan migration, analyze architecture diagrams, and estimate costs.\n\n*How can I help you today?*`,
+      },
+    ];
   });
+  const [isLoading, setIsLoading] = useState(false);
+  const messagesEndRef = useRef(null);
+  const sessionIdRef = useRef(getSessionId());
 
-  // ... (lines 22-104 remain same, jumping to return)
+  useEffect(() => {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(messages));
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  async function handleSendMessage(text, image) {
+    const userText = text?.trim() || (image ? 'Uploaded architecture image' : '');
+    if (!userText || isLoading) return;
+
+    const nextMessages = [...messages, { role: 'user', content: userText }];
+    setMessages(nextMessages);
+    setIsLoading(true);
+
+    try {
+      const body = {
+        input: userText,
+        context: { session_id: sessionIdRef.current },
+      };
+      if (image?.payload) body.image_base64 = image.payload;
+
+      const res = await fetch(API_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+
+      const data = await res.json();
+      const assistantText =
+        data?.output || data?.response || data?.message || data?.body || 'No response received.';
+
+      setMessages((prev) => [...prev, { role: 'assistant', content: String(assistantText) }]);
+    } catch (error) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: 'assistant',
+          content: `Request failed: ${error.message}. Check service logs and API health.`,
+        },
+      ]);
+    } finally {
+      setIsLoading(false);
+    }
+  }
 
   return (
     <div className="app-container">
       <header className="header glass-card">
-        <div className="logo">🚀</div>
+        <div className="logo">A</div>
         <div style={{ flex: 1 }}>
-          <h1>{import.meta.env.VITE_APP_TITLE || "AWS Migration Assistant"}</h1>
+          <h1>{import.meta.env.VITE_APP_TITLE || 'AWS Migration Assistant'}</h1>
           <span className="badge">AgentCore Gateway</span>
         </div>
-
       </header>
 
       <main className="chat-area">
@@ -63,7 +125,8 @@ function App() {
         }
 
         .logo {
-          font-size: 24px;
+          font-size: 18px;
+          font-weight: 700;
           background: var(--bg-tertiary);
           width: 40px;
           height: 40px;
@@ -71,6 +134,7 @@ function App() {
           align-items: center;
           justify-content: center;
           border-radius: 10px;
+          color: var(--text-primary);
         }
 
         .header h1 {
@@ -96,7 +160,7 @@ function App() {
 
         .messages-list {
           padding: 24px;
-          padding-bottom: 140px; /* Space for input area */
+          padding-bottom: 140px;
           max-width: 900px;
           margin: 0 auto;
         }
@@ -109,23 +173,7 @@ function App() {
           padding: 0 24px;
           z-index: 20;
         }
-        .sign-out-btn {
-          background: rgba(255, 255, 255, 0.05);
-          border: 1px solid var(--glass-border);
-          color: var(--text-primary);
-          padding: 6px 12px;
-          border-radius: 6px;
-          cursor: pointer;
-          font-size: 0.8rem;
-          transition: all 0.2s;
-        }
-        .sign-out-btn:hover {
-          background: rgba(239, 68, 68, 0.2);
-          border-color: rgba(239, 68, 68, 0.4);
-        }
       `}</style>
     </div>
   );
 }
-
-export default App;
