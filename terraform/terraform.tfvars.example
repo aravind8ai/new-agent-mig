@@ -1,0 +1,9 @@
+aws_region = "us-east-1"
+app_name   = "migration-agent-cloud"
+
+# Optional: set this only if your agent uses an external gateway.
+gateway_url = ""
+
+container_image_tag  = "latest"
+desired_count        = 1
+force_new_deployment = false
