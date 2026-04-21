@@ -66,8 +66,56 @@ export default function App() {
       }
 
       const data = await res.json();
-      const assistantText =
-        data?.output || data?.response || data?.message || data?.body || 'No response received.';
+      const extractAssistantText = (payload) => {
+        if (payload == null) return '';
+        if (typeof payload === 'string') return payload.trim();
+
+        const direct =
+          payload.output ||
+          payload.response ||
+          payload.message ||
+          payload.answer ||
+          payload.completion ||
+          payload.text;
+        if (typeof direct === 'string' && direct.trim()) return direct.trim();
+
+        // Common Lambda proxy shape: { statusCode, body: "..." }
+        if (typeof payload.body === 'string' && payload.body.trim()) {
+          const bodyText = payload.body.trim();
+          try {
+            const parsedBody = JSON.parse(bodyText);
+            const nested = extractAssistantText(parsedBody);
+            if (nested) return nested;
+          } catch (_) {
+            return bodyText;
+          }
+        }
+
+        // Common model/tool response shapes
+        if (Array.isArray(payload.content) && payload.content.length > 0) {
+          const textParts = payload.content
+            .map((item) => (typeof item === 'string' ? item : item?.text))
+            .filter(Boolean)
+            .join('\n')
+            .trim();
+          if (textParts) return textParts;
+        }
+
+        if (Array.isArray(payload.results) && payload.results.length > 0) {
+          const nested = extractAssistantText(payload.results[0]);
+          if (nested) return nested;
+        }
+
+        if (payload.result) {
+          const nested = extractAssistantText(payload.result);
+          if (nested) return nested;
+        }
+
+        const debugText = JSON.stringify(payload);
+        return debugText && debugText !== '{}' ? debugText : '';
+      };
+
+      const assistantText = extractAssistantText(data) || 'No response received.';
 
       setMessages((prev) => [...prev, { role: 'assistant', content: String(assistantText) }]);
     } catch (error) {
