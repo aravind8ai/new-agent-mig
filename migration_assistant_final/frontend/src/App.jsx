@@ -3,13 +3,11 @@ import MessageBubble from './components/Chat/MessageBubble';
 import InputArea from './components/Chat/InputArea';
 import TypingIndicator from './components/Chat/TypingIndicator';
 import './styles/global.css';
-import { Authenticator } from '@aws-amplify/ui-react';
-import '@aws-amplify/ui-react/styles.css';
 
 // Mock Endpoint - In production, this comes from ENV
 const API_ENDPOINT = import.meta.env.VITE_BACKEND_URL ? `${import.meta.env.VITE_BACKEND_URL}/invocations` : "/invocations";
 
-function App({ signOut, user }) {
+function App() {
   const [messages, setMessages] = useState(() => {
     const saved = localStorage.getItem('chat_history');
     if (saved) return JSON.parse(saved);
@@ -31,18 +29,6 @@ function App({ signOut, user }) {
           <span className="badge">AgentCore Gateway</span>
         </div>
 
-        {/* User Profile & Sign Out */}
-        <div className="user-profile" style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <div style={{ textAlign: 'right', fontSize: '0.85rem' }}>
-            <div style={{ color: 'var(--text-secondary)' }}>Welcome,</div>
-            <div style={{ fontWeight: '600', color: 'var(--accent-primary)' }}>
-              {user?.username || user?.signInDetails?.loginId || 'User'}
-            </div>
-          </div>
-          <button onClick={signOut} className="sign-out-btn">
-            Sign Out
-          </button>
-        </div>
       </header>
 
       <main className="chat-area">
@@ -137,28 +123,9 @@ function App({ signOut, user }) {
           background: rgba(239, 68, 68, 0.2);
           border-color: rgba(239, 68, 68, 0.4);
         }
-        .auth-wrapper {
-          display: flex;
-          justify-content: center;
-          align-items: center;
-          height: 100vh;
-          background: radial-gradient(circle at 50% 10%, #1a1a2e 0%, #0f0f12 60%);
-        }
       `}</style>
     </div>
   );
 }
 
-// export default App;
-
-export default function AppWithAuth() {
-  return (
-    <div className="auth-wrapper">
-      <Authenticator>
-        {({ signOut, user }) => (
-          <App signOut={signOut} user={user} />
-        )}
-      </Authenticator>
-    </div>
-  );
-}
+export default App;
