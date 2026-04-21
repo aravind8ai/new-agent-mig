@@ -6,6 +6,88 @@ import os
 
 # --- Lambda Handler ---
 
+def _is_bedrock_action_group_event(event):
+    return isinstance(event, dict) and event.get("messageVersion") == "1.0" and "actionGroup" in event
+
+def _extract_field(event, field_name):
+    # 1) Direct payload style: { "payload": "...", "cidr": "..." }
+    if isinstance(event, dict) and field_name in event:
+        return event.get(field_name)
+
+    # 2) Function details style: parameters array
+    for param in event.get("parameters", []) if isinstance(event, dict) else []:
+        if param.get("name") == field_name:
+            return param.get("value")
+
+    # 3) API schema style: requestBody.content.application/json.properties
+    request_body = event.get("requestBody", {}) if isinstance(event, dict) else {}
+    content = request_body.get("content", {}) if isinstance(request_body, dict) else {}
+    for _, content_obj in content.items():
+        for prop in content_obj.get("properties", []) if isinstance(content_obj, dict) else []:
+            if prop.get("name") == field_name:
+                return prop.get("value")
+
+    return None
+
+def _resolve_tool_name(event, context):
+    tool_name = ""
+
+    # 1) Try context (Bedrock Agent)
+    try:
+        if context and context.client_context and context.client_context.custom:
+            tool_name = context.client_context.custom.get('bedrockAgentCoreToolName', '')
+    except Exception:
+        pass
+
+    # 2) Bedrock action group API schema/function details
+    if not tool_name and isinstance(event, dict):
+        if event.get("function"):
+            tool_name = event.get("function")
+        elif event.get("apiPath"):
+            path_to_tool = {
+                "/cost-assistant": "cost_assistant",
+                "/aws-docs-assistant": "aws_docs_assistant",
+                "/vpc-subnet-calculator": "vpc_subnet_calculator",
+            }
+            tool_name = path_to_tool.get(event.get("apiPath"), "")
+
+    # 3) Direct invoke style
+    if not tool_name and isinstance(event, dict) and 'tool_name' in event:
+        tool_name = event['tool_name']
+    elif not tool_name and isinstance(event, dict) and 'body' in event:
+        try:
+            body_json = json.loads(event['body'])
+            tool_name = body_json.get('tool_name', '')
+        except Exception:
+            pass
+
+    if "___" in tool_name:
+        tool_name = tool_name.split("___")[1]
+
+    return tool_name
+
+def _bedrock_response(event, status_code, result_text):
+    api_path = event.get("apiPath") or "/unknown"
+    http_method = event.get("httpMethod") or "POST"
+    action_group = event.get("actionGroup") or "migration-tools"
+
+    return {
+        "messageVersion": "1.0",
+        "response": {
+            "actionGroup": action_group,
+            "apiPath": api_path,
+            "httpMethod": http_method,
+            "httpStatusCode": status_code,
+            "responseBody": {
+                "application/json": {
+                    "body": json.dumps({"result": result_text})
+                }
+            }
+        },
+        "sessionAttributes": event.get("sessionAttributes", {}),
+        "promptSessionAttributes": event.get("promptSessionAttributes", {})
+    }
+
 def lambda_handler(event, context):
     """
     Main entry point for the Lambda function.
@@ -14,54 +96,43 @@ def lambda_handler(event, context):
     # Debug logging
     print("Received event:", json.dumps(event))
     
-    # Extract the tool name
-    # The Gateway passes the tool name in the client context
-    tool_name = ""
-    # 1. Try context (Bedrock Agent)
-    if context.client_context and context.client_context.custom:
-        tool_name = context.client_context.custom.get('bedrockAgentCoreToolName', '')
-    
-    # 2. Try Event Body (Direct HTTP Invoke)
-    if not tool_name and 'tool_name' in event:
-        tool_name = event['tool_name']
-    elif not tool_name and 'body' in event:
-        # Gateway might wrap body as string
-        try:
-            body_json = json.loads(event['body'])
-            tool_name = body_json.get('tool_name', '')
-        except:
-            pass
-
-    # If using the "___" naming convention (TargetName___ToolName), strip the prefix
-    if "___" in tool_name:
-        tool_name = tool_name.split("___")[1]
+    tool_name = _resolve_tool_name(event, context)
     
     print(f"Routing to Tool: {tool_name}")
     
     try:
         if tool_name == 'cost_assistant':
-            result = cost_assistant(event)
+            payload = _extract_field(event, "payload") or _extract_field(event, "service")
+            result = cost_assistant(payload or event)
         elif tool_name == 'aws_docs_assistant':
-            result = aws_docs_assistant(event)
+            payload = _extract_field(event, "payload") or _extract_field(event, "query")
+            result = aws_docs_assistant(payload or event)
         elif tool_name == 'vpc_subnet_calculator':
-            result = vpc_subnet_calculator(event)
+            cidr = _extract_field(event, "cidr")
+            az_count = _extract_field(event, "az_count")
+            tiers = _extract_field(event, "tiers")
+            payload = {}
+            if cidr:
+                payload["cidr"] = cidr
+            if az_count:
+                payload["az_count"] = az_count
+            if tiers:
+                payload["tiers"] = tiers
+            result = vpc_subnet_calculator(payload if payload else event)
         else:
-            # Fallback for testing or direct invocation
-            return {
-                'statusCode': 400,
-                'body': f"Unknown or missing tool name: '{tool_name}'. Context: {context.client_context}"
-            }
+            message = f"Unknown or missing tool name: '{tool_name}'."
+            if _is_bedrock_action_group_event(event):
+                return _bedrock_response(event, 400, message)
+            return {'statusCode': 400, 'body': message}
             
-        return {
-            'statusCode': 200,
-            'body': result
-        }
+        if _is_bedrock_action_group_event(event):
+            return _bedrock_response(event, 200, result)
+        return {'statusCode': 200, 'body': result}
     except Exception as e:
         print(f"Error executing {tool_name}: {e}")
-        return {
-            'statusCode': 500,
-            'body': f"Error executing tool: {str(e)}"
-        }
+        if _is_bedrock_action_group_event(event):
+            return _bedrock_response(event, 500, f"Error executing tool: {str(e)}")
+        return {'statusCode': 500, 'body': f"Error executing tool: {str(e)}"}
 
 # --- Tool Implementations ---
 

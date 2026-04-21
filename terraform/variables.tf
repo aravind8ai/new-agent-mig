@@ -19,7 +19,7 @@ variable "create_bedrock_agent" {
 variable "bedrock_foundation_model" {
   description = "Foundation model for Bedrock Agent orchestration"
   type        = string
-  default     = "arn:aws:bedrock:us-east-1:470226123391:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0"
+  default     = "us.amazon.nova-pro-v1:0"
 }
 
 variable "bedrock_agent_instruction" {
@@ -43,7 +43,7 @@ variable "bedrock_agent_alias_name" {
 variable "bedrock_tools_action_group_name" {
   description = "Action group name used to attach the tools Lambda to the Bedrock Agent"
   type        = string
-  default     = "migration-tools"
+  default     = "migration_tools"
 }
 
 
