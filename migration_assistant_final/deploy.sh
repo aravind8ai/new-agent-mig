@@ -14,11 +14,17 @@ if [ -f ".env" ]; then
     set +a
 fi
 
-APP_NAME="${APP_NAME}" # Default if not in .env
+APP_NAME="${APP_NAME}" # Must be provided via environment or .env
 APP_TITLE="${APP_TITLE:-AWS Migration Assistant}" # Frontend Title
 ECS_CLUSTER_NAME="${APP_NAME}-cluster"
 ECS_SERVICE_NAME="${APP_NAME}-service"
-AWS_REGION="us-east-1"
+AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
+DESIRED_COUNT="${DESIRED_COUNT:-1}"
+
+if [ -z "${APP_NAME}" ]; then
+    echo "[ERROR] APP_NAME is not set. Set it in .env or export APP_NAME before running deploy.sh."
+    exit 1
+fi
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 ECR_REPO_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${APP_NAME}"
 
@@ -51,6 +57,7 @@ docker push ${ECR_REPO_URI}:latest
 # 5. Force Update ECS Service
 echo "[INFO] Updating ECS Service to pull new image..."
 aws ecs update-service --cluster ${ECS_CLUSTER_NAME} --service ${ECS_SERVICE_NAME} --force-new-deployment --region ${AWS_REGION} > /dev/null
+aws ecs update-service --cluster ${ECS_CLUSTER_NAME} --service ${ECS_SERVICE_NAME} --desired-count ${DESIRED_COUNT} --region ${AWS_REGION} > /dev/null
 
 # 6. Retrieve URL
 echo "[INFO] Retrieving Application URL..."

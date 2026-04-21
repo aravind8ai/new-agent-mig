@@ -1,3 +1,13 @@
+output "vpc_id" {
+  description = "ID of the VPC created for the agent stack"
+  value       = aws_vpc.main.id
+}
+
+output "public_subnet_ids" {
+  description = "Public subnet IDs used by ALB and ECS"
+  value       = aws_subnet.public[*].id
+}
+
 output "ecr_repository_url" {
   description = "ECR repository URL to push the container image"
   value       = aws_ecr_repository.app.repository_url

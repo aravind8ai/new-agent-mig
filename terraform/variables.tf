@@ -10,6 +10,23 @@ variable "app_name" {
   default     = "migration-agent-cloud"
 }
 
+variable "vpc_cidr" {
+  description = "CIDR block for the new VPC"
+  type        = string
+  default     = "10.50.0.0/16"
+}
+
+variable "public_subnet_cidrs" {
+  description = "CIDR blocks for public subnets (use at least two in different AZs for ALB)"
+  type        = list(string)
+  default     = ["10.50.1.0/24", "10.50.2.0/24"]
+
+  validation {
+    condition     = length(var.public_subnet_cidrs) >= 2
+    error_message = "Provide at least two public subnet CIDRs for the ALB."
+  }
+}
+
 variable "gateway_url" {
   description = "Gateway URL injected into ECS task environment"
   type        = string
@@ -35,9 +52,9 @@ variable "task_memory" {
 }
 
 variable "desired_count" {
-  description = "Desired ECS task count"
+  description = "Desired ECS task count (set to 0 for infra-first bootstrap, then scale to 1 after image push)"
   type        = number
-  default     = 1
+  default     = 0
 }
 
 variable "log_retention_days" {
