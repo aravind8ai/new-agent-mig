@@ -20,6 +20,7 @@ output "bedrock_agent_alias_id" {
   value       = var.create_bedrock_agent ? aws_bedrockagent_agent_alias.migration[0].agent_alias_id : null
 }
 
+output "aws_subnet_public_ids" {
   description = "Public subnet IDs used by ALB and ECS"
   value       = aws_subnet.public[*].id
 }
