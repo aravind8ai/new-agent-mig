@@ -2,7 +2,7 @@ aws_region = "us-east-1"
 app_name   = "migration-agent-cloud"
 
 create_bedrock_agent                   = true
-bedrock_foundation_model               = "anthropic.claude-3-7-sonnet-20250219-v1:0"
+bedrock_foundation_model               = "us.anthropic.claude-3-7-sonnet-20250219-v1:0"
 bedrock_agent_alias_name               = "prod"
 bedrock_tools_action_group_name        = "migration-tools"
 bedrock_idle_session_ttl_in_seconds    = 900
