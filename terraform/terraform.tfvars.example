@@ -1,9 +1,12 @@
 aws_region = "us-east-1"
 app_name   = "migration-agent-cloud"
 
+vpc_cidr            = "10.50.0.0/16"
+public_subnet_cidrs = ["10.50.1.0/24", "10.50.2.0/24"]
+
 # Optional: set this only if your agent uses an external gateway.
 gateway_url = ""
 
 container_image_tag  = "latest"
-desired_count        = 1
+desired_count        = 0
 force_new_deployment = false
