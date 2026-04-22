@@ -354,7 +354,7 @@ def _sanitize_mermaid_code(code: str) -> str:
         # Split accidentally concatenated edge statements like:
         # DB["Amazon RDS"]APP --> OBJ["Amazon S3"]
         line = re.sub(
-            r"(\[[^\]]*\]|\([^)]+\)|\{[^}]+\}|\"[^\"]*\")\s*([A-Za-z_][A-Za-z0-9_]*\s*(?:-->|-.->|==>))",
+            r"(\[[^\]]*\]|\([^)]+\)|\{[^}]+\}|\"[^\"]*\")\s*([A-Za-z_][A-Za-z0-9_]*\s*(?:-->|-\.->|==>))",
             r"\1\n\2",
             line,
         )
@@ -385,9 +385,9 @@ def _sanitize_mermaid_code(code: str) -> str:
     cleaned = cleaned.encode("ascii", errors="ignore").decode("ascii")
 
     # Reject known bad concatenations and broken/incomplete edge endings.
-    if re.search(r"(\[[^\]]*\]|\([^)]+\)|\{[^}]+\}|\"[^\"]*\")\s*[A-Za-z_][A-Za-z0-9_]*\s*(?:-->|-.->|==>)", cleaned):
+    if re.search(r"(\[[^\]]*\]|\([^)]+\)|\{[^}]+\}|\"[^\"]*\")\s*[A-Za-z_][A-Za-z0-9_]*\s*(?:-->|-\.->|==>)", cleaned):
         return ""
-    if re.search(r"(?:-->|-.->|==>)\s*$", cleaned, flags=re.MULTILINE):
+    if re.search(r"(?:-->|-\.->|==>)\s*$", cleaned, flags=re.MULTILINE):
         return ""
     if re.search(r"(?:--|==|-\.->|->)\s*$", cleaned, flags=re.MULTILINE):
         return ""
@@ -403,7 +403,7 @@ def _sanitize_mermaid_code(code: str) -> str:
 
     edge_pattern = re.compile(
         r'^[A-Za-z_][A-Za-z0-9_]*(?:\["[^"]*"\]|\([^)]+\)|\{[^}]+\})?\s*'
-        r'(?:-->|-.->|==>)\s*'
+        r'(?:-->|-\.->|==>)\s*'
         r'[A-Za-z_][A-Za-z0-9_]*(?:\["[^"]*"\]|\([^)]+\)|\{[^}]+\})?$'
     )
     node_pattern = re.compile(
