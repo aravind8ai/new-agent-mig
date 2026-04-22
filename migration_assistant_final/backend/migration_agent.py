@@ -678,6 +678,7 @@ Your goal is to guide users through the complex process of migrating on-premises
 ### Operational Rules
 *   **Step-by-Step Approach**: Break complex migrations into logical phases.
 *   **Diagram Generation**: Use the `arch_diag_assistant` to create professional diagrams.
+*   **Diagram Edits**: If the user asks to modify/update/redraw/enhance an architecture diagram (including adding AWS icons), you **MUST** call `arch_diag_assistant` and return a diagram image link.
 *   **CRITICAL - Image Links**: If a tool (like `arch_diag_assistant`) returns a Markdown Image Link (e.g., `![Architecture Diagram](/diagrams/...)`), you **MUST** include this link **VERBATIM** in your final response. **Do NOT remove it**. It is required for the user to see the diagram.
 *   **Tone**: Professional, encouraging, and technically precise.
 
@@ -694,11 +695,16 @@ def _is_diagram_or_image_request(user_text: str) -> bool:
     diagram_keywords = [
         "diagram",
         "draw",
+        "redraw",
+        "modify diagram",
+        "update diagram",
         "generate image",
         "architecture image",
         "architecture diagram",
         "flowchart",
         "visual",
+        "aws icon",
+        "icons",
         "png",
         "hld",
         "lld",
@@ -707,12 +713,28 @@ def _is_diagram_or_image_request(user_text: str) -> bool:
 
 def _is_diagram_generation_request(user_text: str) -> bool:
     text = (user_text or "").lower()
-    generation_words = ["generate", "create", "draw", "build", "produce"]
-    diagram_words = ["diagram", "architecture", "image", "visual", "flowchart", "png"]
+    generation_words = [
+        "generate", "create", "draw", "build", "produce",
+        "modify", "update", "redraw", "revise", "enhance", "add", "convert"
+    ]
+    diagram_words = ["diagram", "architecture", "image", "visual", "flowchart", "png", "icon", "icons"]
     return any(word in text for word in generation_words) and any(word in text for word in diagram_words)
 
 def _contains_markdown_image(text: str) -> bool:
     return bool(re.search(r"!\[[^\]]*\]\([^)]+\)", text or ""))
+
+def _looks_like_diagram_refusal(text: str) -> bool:
+    response = (text or "").lower()
+    refusal_patterns = [
+        "cannot directly modify",
+        "can't directly modify",
+        "cannot modify the diagram",
+        "i cannot directly",
+        "i can provide guidance",
+        "unable to generate",
+        "unable to create a diagram",
+    ]
+    return any(pattern in response for pattern in refusal_patterns)
 
 def invoke_local_migration_agent(prompt_text: str) -> str:
     """Run local Strands orchestration with both remote and local tools enabled."""
@@ -886,6 +908,16 @@ Current User Input:
         if wants_diagram_generation and not _contains_markdown_image(response_text):
             logger.warning("No image link detected in response. Re-trying locally to force diagram generation.")
             response_text = await loop.run_in_executor(None, invoke_local_migration_agent, user_input)
+
+        # Hard fallback: if still no image for a diagram generation/edit request, invoke diagram tool directly.
+        if needs_local_tools and wants_diagram_generation and not _contains_markdown_image(response_text):
+            if _looks_like_diagram_refusal(response_text):
+                logger.warning("Diagram refusal detected. Invoking arch_diag_assistant directly.")
+            else:
+                logger.warning("No image after retries for diagram task. Invoking arch_diag_assistant directly.")
+            direct_diagram = await loop.run_in_executor(None, arch_diag_assistant, original_user_input)
+            if direct_diagram:
+                response_text = direct_diagram
         
         # 2. Save Interaction to Memory
         add_to_memory(session_id, "user", original_user_input)
