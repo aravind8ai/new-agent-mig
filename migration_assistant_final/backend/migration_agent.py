@@ -4,6 +4,7 @@ import asyncio
 import time
 import logging
 import json
+import re
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 # Load environment variables
@@ -357,11 +358,19 @@ def arch_diag_assistant(payload):
         if not tmp_diagram_dir.exists(): 
              tmp_diagram_dir.mkdir(parents=True, exist_ok=True)
 
-        frontend_dir = Path("../migration_agent_frontend/public/diagrams")
-        # Only try to create frontend dir if running locally and folder structure exists
-        is_local_dev = frontend_dir.parent.exists()
-        if is_local_dev:
-            frontend_dir.mkdir(parents=True, exist_ok=True)
+        # Local fallback locations:
+        # 1) Container runtime: /app/static/diagrams (served by nginx root /app/static)
+        # 2) Local dev: ../frontend/public/diagrams (served by Vite static public directory)
+        local_diagram_dir = None
+        local_candidates = [
+            Path(SCRIPT_DIR) / "static" / "diagrams",
+            Path(SCRIPT_DIR).parent / "frontend" / "public" / "diagrams",
+        ]
+        for candidate in local_candidates:
+            if candidate.parent.exists():
+                candidate.mkdir(parents=True, exist_ok=True)
+                local_diagram_dir = candidate
+                break
 
         def save_generated_image(image_bytes, ext="png"):
             fname = f"diagram_{uuid4().hex[:8]}_{int(time.time())}.{ext}"
@@ -388,8 +397,8 @@ def arch_diag_assistant(payload):
                     print(f"[WARNING] Failed to upload to S3: {e}")
             
             # 2. Local Fallback
-            if is_local_dev:
-                dest = frontend_dir / fname
+            if local_diagram_dir:
+                dest = local_diagram_dir / fname
                 with open(dest, "wb") as f:
                     f.write(image_bytes)
                 print(f"[SUCCESS] Saved diagram locally to {dest}")
@@ -398,6 +407,9 @@ def arch_diag_assistant(payload):
             return None
 
         for part in response.message.get("content", []):
+            if not isinstance(part, dict):
+                continue
+
             if part.get("type") == "text":
                 text_parts.append(part["text"])
             
@@ -406,7 +418,9 @@ def arch_diag_assistant(payload):
             if b64_data:
                 try:
                     image_bytes = base64.b64decode(b64_data)
-                    ext = (part.get("format") or "png").replace(".", "")
+                    ext = (part.get("format") or "png").replace(".", "").lower()
+                    if "/" in ext:
+                        ext = ext.split("/")[-1]
                     url = save_generated_image(image_bytes, ext)
                     if url:
                         saved_images.append(url)
@@ -493,6 +507,58 @@ You have access to a suite of tools, some running on a remote Gateway and some l
 Use them seamlessly to assist the user.
 """
 
+def _is_diagram_or_image_request(user_text: str) -> bool:
+    text = (user_text or "").lower()
+    diagram_keywords = [
+        "diagram",
+        "draw",
+        "generate image",
+        "architecture image",
+        "architecture diagram",
+        "flowchart",
+        "visual",
+        "png",
+        "hld",
+        "lld",
+    ]
+    return any(keyword in text for keyword in diagram_keywords)
+
+def _is_diagram_generation_request(user_text: str) -> bool:
+    text = (user_text or "").lower()
+    generation_words = ["generate", "create", "draw", "build", "produce"]
+    diagram_words = ["diagram", "architecture", "image", "visual", "flowchart", "png"]
+    return any(word in text for word in generation_words) and any(word in text for word in diagram_words)
+
+def _contains_markdown_image(text: str) -> bool:
+    return bool(re.search(r"!\[[^\]]*\]\([^)]+\)", text or ""))
+
+def invoke_local_migration_agent(prompt_text: str) -> str:
+    """Run local Strands orchestration with both remote and local tools enabled."""
+    all_tools = [
+        cost_assistant,
+        aws_docs_assistant,
+        vpc_subnet_calculator,
+        hld_lld_input_agent,
+        arch_diag_assistant
+    ]
+    migration_agent = Agent(
+        model="us.amazon.nova-pro-v1:0",
+        system_prompt=migration_system_prompt,
+        tools=all_tools
+    )
+    response = migration_agent(prompt_text)
+
+    content = response.message.get("content", []) if getattr(response, "message", None) else []
+    text_parts = []
+    for part in content:
+        if isinstance(part, dict) and part.get("text"):
+            text_parts.append(part["text"])
+        elif isinstance(part, str):
+            text_parts.append(part)
+
+    extracted = "\n".join(text_parts).strip()
+    return extracted or str(response)
+
 def invoke_bedrock_agent_runtime(prompt_text, session_id):
     """
     Invoke managed Bedrock Agent Runtime using agent and alias IDs from env.
@@ -570,6 +636,7 @@ async def migration_assistant(payload):
         user_input = payload.get("input") or payload.get("prompt")
         user_id = payload.get("user_id", "unknown")
         context = payload.get("context", {}) 
+    user_input = user_input or ""
     import traceback
     
     # Session Management
@@ -613,28 +680,30 @@ Current User Input:
     else:
         CURRENT_IMAGE_CONTEXT["payload"] = None
 
-    try:
-        # Primary path: managed Bedrock Agent Runtime (created by Terraform)
-        loop = asyncio.get_running_loop()
-        response_text = await loop.run_in_executor(None, invoke_bedrock_agent_runtime, user_input, session_id)
+    needs_local_tools = bool(image_data) or _is_diagram_or_image_request(original_user_input)
+    wants_diagram_generation = _is_diagram_generation_request(original_user_input)
 
-        # Fallback path: local Strands orchestration if Bedrock Agent env is not configured
-        if not response_text:
-            logger.warning("Falling back to local Strands agent execution (Bedrock Agent Runtime unavailable).")
-            all_tools = [
-                cost_assistant,
-                aws_docs_assistant, 
-                vpc_subnet_calculator,
-                hld_lld_input_agent,
-                arch_diag_assistant
-            ]
-            migration_agent = Agent(
-                model="us.amazon.nova-pro-v1:0",
-                system_prompt=migration_system_prompt,
-                tools=all_tools
-            )
-            response = await loop.run_in_executor(None, migration_agent, user_input)
-            response_text = response.message['content'][0]['text']
+    try:
+        loop = asyncio.get_running_loop()
+        response_text = None
+
+        # Diagram/image tasks require local-only tools, so route these directly.
+        if needs_local_tools:
+            logger.info("Routing request to local Strands orchestration for diagram/image workflow.")
+            response_text = await loop.run_in_executor(None, invoke_local_migration_agent, user_input)
+        else:
+            # Primary path: managed Bedrock Agent Runtime (created by Terraform)
+            response_text = await loop.run_in_executor(None, invoke_bedrock_agent_runtime, user_input, session_id)
+
+            # Fallback path: local Strands orchestration if managed agent is unavailable
+            if not response_text:
+                logger.warning("Falling back to local Strands agent execution (Bedrock Agent Runtime unavailable).")
+                response_text = await loop.run_in_executor(None, invoke_local_migration_agent, user_input)
+
+        # Safety: if a diagram/image request somehow returned no image link, try local toolchain once.
+        if wants_diagram_generation and not _contains_markdown_image(response_text):
+            logger.warning("No image link detected in response. Re-trying locally to force diagram generation.")
+            response_text = await loop.run_in_executor(None, invoke_local_migration_agent, user_input)
         
         # 2. Save Interaction to Memory
         add_to_memory(session_id, "user", original_user_input)
