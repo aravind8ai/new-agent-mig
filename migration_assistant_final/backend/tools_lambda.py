@@ -3,6 +3,9 @@ import boto3
 import ipaddress
 import math
 import os
+import re
+from urllib.parse import quote_plus, unquote
+from urllib.request import Request, urlopen
 
 # --- Lambda Handler ---
 
@@ -136,41 +139,387 @@ def lambda_handler(event, context):
 
 # --- Tool Implementations ---
 
+REGION_TO_PRICING_LOCATION = {
+    "us-east-1": "US East (N. Virginia)",
+    "us-east-2": "US East (Ohio)",
+    "us-west-1": "US West (N. California)",
+    "us-west-2": "US West (Oregon)",
+    "ca-central-1": "Canada (Central)",
+    "eu-west-1": "EU (Ireland)",
+    "eu-west-2": "EU (London)",
+    "eu-west-3": "EU (Paris)",
+    "eu-central-1": "EU (Frankfurt)",
+    "eu-central-2": "Europe (Zurich)",
+    "eu-north-1": "EU (Stockholm)",
+    "eu-south-1": "EU (Milan)",
+    "eu-south-2": "EU (Spain)",
+    "ap-south-1": "Asia Pacific (Mumbai)",
+    "ap-south-2": "Asia Pacific (Hyderabad)",
+    "ap-northeast-1": "Asia Pacific (Tokyo)",
+    "ap-northeast-2": "Asia Pacific (Seoul)",
+    "ap-northeast-3": "Asia Pacific (Osaka)",
+    "ap-southeast-1": "Asia Pacific (Singapore)",
+    "ap-southeast-2": "Asia Pacific (Sydney)",
+    "ap-southeast-3": "Asia Pacific (Jakarta)",
+    "ap-southeast-4": "Asia Pacific (Melbourne)",
+    "ap-east-1": "Asia Pacific (Hong Kong)",
+    "sa-east-1": "South America (Sao Paulo)",
+    "me-south-1": "Middle East (Bahrain)",
+    "me-central-1": "Middle East (UAE)",
+    "af-south-1": "Africa (Cape Town)"
+}
+
+SERVICE_CODE_ALIASES = {
+    "ec2": "AmazonEC2",
+    "amazon ec2": "AmazonEC2",
+    "elastic compute cloud": "AmazonEC2",
+    "instance": "AmazonEC2",
+    "rds": "AmazonRDS",
+    "amazon rds": "AmazonRDS",
+    "aurora": "AmazonRDS",
+    "lambda": "AWSLambda",
+    "aws lambda": "AWSLambda",
+    "s3": "AmazonS3",
+    "amazon s3": "AmazonS3",
+    "dynamodb": "AmazonDynamoDB",
+    "amazon dynamodb": "AmazonDynamoDB",
+    "ecs": "AmazonECS",
+    "fargate": "AmazonECS",
+    "elb": "AWSELB",
+    "alb": "AWSELB",
+    "nlb": "AWSELB",
+    "load balancer": "AWSELB"
+}
+
+DIRECT_SERVICE_CODES = {
+    "amazonec2": "AmazonEC2",
+    "amazonrds": "AmazonRDS",
+    "awslambda": "AWSLambda",
+    "amazons3": "AmazonS3",
+    "amazondynamodb": "AmazonDynamoDB",
+    "amazonecs": "AmazonECS",
+    "awselb": "AWSELB",
+}
+
+def _normalize_payload(payload):
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        return {"payload": text}
+    return {"payload": str(payload)}
+
+def _extract_region_from_text(text):
+    if not text:
+        return None
+    match = re.search(r"\b[a-z]{2}-[a-z]+-\d\b", text.lower())
+    return match.group(0) if match else None
+
+def _extract_ec2_instance_type(text):
+    if not text:
+        return None
+    match = re.search(r"\b([a-z][0-9][a-z0-9]*\.[a-z0-9]+)\b", text.lower())
+    return match.group(1) if match else None
+
+def _extract_rds_instance_type(text):
+    if not text:
+        return None
+    match = re.search(r"\b(db\.[a-z0-9]+\.[a-z0-9]+)\b", text.lower())
+    return match.group(1) if match else None
+
+def _resolve_service_code(raw_service):
+    if not raw_service:
+        return None
+
+    service_text = str(raw_service).strip().lower()
+    if service_text in DIRECT_SERVICE_CODES:
+        return DIRECT_SERVICE_CODES[service_text]
+
+    if service_text in SERVICE_CODE_ALIASES:
+        return SERVICE_CODE_ALIASES[service_text]
+
+    for alias, service_code in SERVICE_CODE_ALIASES.items():
+        if alias in service_text:
+            return service_code
+
+    return None
+
+def _region_to_pricing_location(region_code):
+    if not region_code:
+        return None
+    return REGION_TO_PRICING_LOCATION.get(region_code.lower())
+
+def _extract_first_ondemand_price(price_item):
+    terms = price_item.get("terms", {}).get("OnDemand", {})
+    for term in terms.values():
+        for dimension in term.get("priceDimensions", {}).values():
+            usd = dimension.get("pricePerUnit", {}).get("USD")
+            if usd:
+                return {
+                    "usd": usd,
+                    "unit": dimension.get("unit", ""),
+                    "description": dimension.get("description", "")
+                }
+    return None
+
+def _maybe_monthly_cost(usd_price, unit):
+    try:
+        value = float(usd_price)
+    except Exception:
+        return None
+    if unit.lower() in {"hrs", "hour", "hours", "hr"}:
+        return round(value * 730, 4)
+    return None
+
+def _build_cost_query(payload):
+    data = _normalize_payload(payload)
+    raw_text = str(data.get("payload") or data.get("query") or data.get("service") or "").strip()
+
+    service_raw = data.get("service") or data.get("service_name") or data.get("serviceCode") or raw_text
+    service_code = _resolve_service_code(service_raw)
+
+    region_code = (data.get("region") or data.get("aws_region") or _extract_region_from_text(raw_text) or "us-east-1").lower()
+    location = data.get("location") or _region_to_pricing_location(region_code) or "US East (N. Virginia)"
+
+    operating_system = str(data.get("operating_system") or data.get("os") or ("Windows" if "windows" in raw_text.lower() else "Linux"))
+    instance_type = data.get("instance_type") or _extract_ec2_instance_type(raw_text)
+    rds_instance_type = data.get("instance_type") or _extract_rds_instance_type(raw_text)
+    database_engine = data.get("database_engine") or data.get("engine") or "MySQL"
+
+    return {
+        "service_code": service_code,
+        "service_raw": str(service_raw or "").strip(),
+        "region_code": region_code,
+        "location": location,
+        "operating_system": operating_system,
+        "instance_type": instance_type,
+        "rds_instance_type": rds_instance_type,
+        "database_engine": database_engine
+    }
+
+def _build_pricing_filters(query):
+    service_code = query["service_code"]
+    filters = [{"Type": "TERM_MATCH", "Field": "location", "Value": query["location"]}]
+
+    if service_code == "AmazonEC2":
+        filters.extend([
+            {"Type": "TERM_MATCH", "Field": "instanceType", "Value": query["instance_type"] or "m5.large"},
+            {"Type": "TERM_MATCH", "Field": "operatingSystem", "Value": query["operating_system"]},
+            {"Type": "TERM_MATCH", "Field": "tenancy", "Value": "Shared"},
+            {"Type": "TERM_MATCH", "Field": "capacitystatus", "Value": "Used"},
+            {"Type": "TERM_MATCH", "Field": "preInstalledSw", "Value": "NA"},
+        ])
+    elif service_code == "AmazonRDS":
+        filters.extend([
+            {"Type": "TERM_MATCH", "Field": "instanceType", "Value": query["rds_instance_type"] or "db.t3.medium"},
+            {"Type": "TERM_MATCH", "Field": "databaseEngine", "Value": query["database_engine"]},
+            {"Type": "TERM_MATCH", "Field": "deploymentOption", "Value": "Single-AZ"},
+        ])
+    elif service_code == "AWSLambda":
+        filters.append({"Type": "TERM_MATCH", "Field": "group", "Value": "AWS-Lambda-Duration"})
+
+    return filters
+
+def _fetch_pricing_products(pricing_client, service_code, filters):
+    attempts = [filters]
+    # Relax optional filters if strict query returns no products.
+    attempts.append([f for f in filters if f["Field"] in {"location", "instanceType", "databaseEngine", "group"}])
+    attempts.append([f for f in filters if f["Field"] != "location"])
+
+    seen = set()
+    for active_filters in attempts:
+        key = tuple((f["Field"], f["Value"]) for f in active_filters)
+        if key in seen:
+            continue
+        seen.add(key)
+        response = pricing_client.get_products(
+            ServiceCode=service_code,
+            Filters=active_filters,
+            MaxResults=25
+        )
+        price_list = response.get("PriceList", [])
+        if price_list:
+            return price_list, active_filters
+    return [], filters
+
+def _format_cost_response(query, product, price, used_filters):
+    attributes = product.get("product", {}).get("attributes", {})
+    service_code = query["service_code"]
+    monthly = _maybe_monthly_cost(price["usd"], price["unit"])
+
+    lines = [
+        f"AWS pricing estimate for service `{service_code}`",
+        f"- Region: {query['region_code']} ({query['location']})",
+        f"- Price: USD {price['usd']} per {price['unit'] or 'unit'}",
+    ]
+
+    if monthly is not None:
+        lines.append(f"- Approx monthly (730 hours): USD {monthly}")
+
+    if attributes.get("instanceType"):
+        lines.append(f"- Instance type: {attributes.get('instanceType')}")
+    if attributes.get("databaseEngine"):
+        lines.append(f"- Database engine: {attributes.get('databaseEngine')}")
+    if attributes.get("operatingSystem"):
+        lines.append(f"- Operating system: {attributes.get('operatingSystem')}")
+    if price.get("description"):
+        lines.append(f"- Meter description: {price['description']}")
+
+    lines.append("- Pricing source: AWS Pricing API (`pricing:GetProducts`)")
+    lines.append(f"- Applied filters: {json.dumps(used_filters)}")
+
+    return "\n".join(lines)
+
 def cost_assistant(payload):
     """
-    Cost Assistant using native boto3 (Replacing MCP Server).
-    In Lambda, we use boto3 directly because running 'uvx' (MCP) is not supported.
-    """
-    client = boto3.client('pricing', region_name='us-east-1')
-    
-    # Example: Simple Price Lookup for EC2 (Real Boto3 Logic)
-    # In a real app, you would parse 'payload' to find the specific service/instance type.
-    try:
-        response = client.get_products(
-            ServiceCode='AmazonEC2',
-            Filters=[
-                {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': 'US East (N. Virginia)'},
-                {'Type': 'TERM_MATCH', 'Field': 'instanceType', 'Value': 'm5.large'},
-                {'Type': 'TERM_MATCH', 'Field': 'operatingSystem', 'Value': 'Linux'}
-            ],
-            MaxResults=1
-        )
-        
-        # Parse the complex JSON response from Pricing API
-        price_list = response['PriceList'][0]
-        # (Simplified parsing for demo purposes - real Pricing API output is very nested)
-        return f"Real Boto3 Pricing Data: {price_list[:200]}..." 
-    except Exception as e:
-        # Fallback if credentials/permissions are missing in this demo environment
-        return f"Error querying AWS Pricing API: {str(e)}. (Ensure Lambda Role has 'pricing:GetProducts' permission)"
+    Cost assistant backed by AWS Pricing API.
+    Supports payload as plain text or JSON string.
 
+    Example payload JSON:
+    {
+      "service": "ec2",
+      "region": "us-east-1",
+      "instance_type": "m5.large",
+      "operating_system": "Linux"
+    }
+    """
+    pricing_client = boto3.client("pricing", region_name="us-east-1")
+    query = _build_cost_query(payload)
+
+    if not query["service_code"]:
+        return (
+            "Unable to determine AWS service for pricing request. "
+            "Supported examples: EC2, RDS, Lambda, S3, DynamoDB, ECS/Fargate, ELB. "
+            "You can also pass JSON payload like "
+            "{\"service\":\"ec2\",\"region\":\"us-east-1\",\"instance_type\":\"m5.large\"}."
+        )
+
+    filters = _build_pricing_filters(query)
+
+    try:
+        price_list, used_filters = _fetch_pricing_products(pricing_client, query["service_code"], filters)
+        if not price_list:
+            return (
+                f"No pricing products found for `{query['service_code']}` in `{query['location']}`. "
+                "Try a more specific payload (for example, include `instance_type` for EC2 or RDS)."
+            )
+
+        parsed_products = []
+        for item in price_list:
+            try:
+                parsed_products.append(json.loads(item) if isinstance(item, str) else item)
+            except Exception:
+                continue
+
+        for product in parsed_products:
+            price = _extract_first_ondemand_price(product)
+            if price:
+                return _format_cost_response(query, product, price, used_filters)
+
+        return (
+            "Pricing products were found, but no OnDemand USD price dimension was detected "
+            "for the current filter set. Please try a more specific query."
+        )
+    except Exception as e:
+        return (
+            f"Error querying AWS Pricing API: {str(e)}. "
+            "Ensure Lambda role has `pricing:GetProducts` permission."
+        )
+
+def _http_get(url, timeout_seconds=12):
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; MigrationAssistant/1.0)"
+        }
+    )
+    with urlopen(req, timeout=timeout_seconds) as response:
+        charset = response.headers.get_content_charset() or "utf-8"
+        return response.read().decode(charset, errors="ignore")
+
+def _extract_docs_links(html_text, limit=5):
+    if not html_text:
+        return []
+
+    raw_links = re.findall(r"https?://[^\s\"'<>]+", html_text)
+    cleaned = []
+    seen = set()
+    for link in raw_links:
+        candidate = unquote(link).rstrip(").,;\"'")
+        if "docs.aws.amazon.com" not in candidate:
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        cleaned.append(candidate)
+        if len(cleaned) >= limit:
+            break
+    return cleaned
+
+def _build_docs_query(payload):
+    data = _normalize_payload(payload)
+    query = str(data.get("query") or data.get("payload") or "").strip()
+    return query
 
 def aws_docs_assistant(payload):
     """
-    Simulated Docs Assistant.
-    In the original agent, this used 'awslabs.aws-documentation-mcp-server'.
+    Search AWS documentation pages in real time (without MCP runtime).
     """
-    return f"AWS Documentation Search Results for '{payload}':\n\n1. Best Practices for Migration: https://aws.amazon.com/migration/ \n2. Serverless Architecture: https://aws.amazon.com/serverless/\n\n(Simulated response from Gateway Lambda)"
+    query = _build_docs_query(payload)
+    if not query:
+        return "Please provide a docs query, for example: `ECS blue/green deployment best practices`."
+
+    encoded = quote_plus(query)
+    search_urls = [
+        f"https://docs.aws.amazon.com/search/doc-search.html?searchPath=documentation-guide&searchQuery={encoded}",
+        f"https://aws.amazon.com/search/?searchQuery={encoded}&f-website-sections=docs",
+    ]
+
+    links = []
+    errors = []
+    for url in search_urls:
+        try:
+            html = _http_get(url)
+            links.extend(_extract_docs_links(html, limit=8))
+        except Exception as e:
+            errors.append(f"{url}: {str(e)}")
+
+    # Deduplicate and keep top N.
+    deduped = []
+    seen = set()
+    for link in links:
+        if link in seen:
+            continue
+        seen.add(link)
+        deduped.append(link)
+        if len(deduped) >= 5:
+            break
+
+    if deduped:
+        result_lines = [f"AWS documentation results for: `{query}`"]
+        for idx, link in enumerate(deduped, start=1):
+            result_lines.append(f"{idx}. {link}")
+        result_lines.append("Source: docs.aws.amazon.com search pages.")
+        return "\n".join(result_lines)
+
+    if errors:
+        return (
+            f"Unable to fetch AWS docs search results for `{query}` right now.\n"
+            f"Network/query errors: {' | '.join(errors)}"
+        )
+
+    return (
+        f"No docs results found for `{query}`. Try a more specific query, "
+        "for example `Amazon RDS Multi-AZ failover`."
+    )
 
 def vpc_subnet_calculator(payload):
     """

@@ -4,6 +4,9 @@ import asyncio
 import time
 import logging
 import json
+import re
+import shutil
+import sys
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 # Load environment variables
@@ -301,6 +304,212 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DIAGRAM_OUTPUT_DIR = Path(os.path.join(SCRIPT_DIR, "generated-diagrams"))
 DIAGRAM_OUTPUT_DIR.mkdir(exist_ok=True)
 
+def _extract_mermaid_code(text: str) -> str:
+    if not text:
+        return ""
+
+    code_match = re.search(r"```(?:mermaid)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+    code = code_match.group(1).strip() if code_match else text.strip()
+    code = "\n".join(line.strip() for line in code.splitlines() if line.strip())
+    if not code:
+        return ""
+    if not code.lower().startswith(("graph ", "flowchart ")):
+        code = "flowchart LR\n" + code
+    return _sanitize_mermaid_code(code)
+
+def _sanitize_mermaid_code(code: str) -> str:
+    """
+    Best-effort cleanup for Nova-generated Mermaid to avoid parser errors.
+    """
+    lines = [line.strip() for line in code.splitlines() if line.strip()]
+    if not lines:
+        return ""
+
+    normalized = []
+    has_flow_header = False
+
+    for raw_line in lines:
+        line = raw_line.encode("ascii", errors="ignore").decode("ascii")
+        line = line.replace("\t", " ")
+        line = re.sub(r"\s{2,}", " ", line).strip()
+
+        # Remove accidental markdown fences if present.
+        if line.startswith("```"):
+            continue
+
+        # Keep only one explicit graph header.
+        if line.lower().startswith(("flowchart ", "graph ")):
+            if not has_flow_header:
+                normalized.append("flowchart LR")
+                has_flow_header = True
+            continue
+
+        # Split accidentally concatenated node declarations like:
+        # EC2_1[Web 1] EC2_2[Web 2]
+        line = re.sub(
+            r"(\[[^\]]*\]|\([^)]+\)|\{[^}]+\})\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?=\[|\(|\{)",
+            r"\1\n\2",
+            line,
+        )
+        # Split accidentally concatenated edge statements like:
+        # DB["Amazon RDS"]APP --> OBJ["Amazon S3"]
+        line = re.sub(
+            r"(\[[^\]]*\]|\([^)]+\)|\{[^}]+\}|\"[^\"]*\")\s*([A-Za-z_][A-Za-z0-9_]*\s*(?:-->|-\.->|==>))",
+            r"\1\n\2",
+            line,
+        )
+
+        for segment in [seg.strip() for seg in line.split("\n") if seg.strip()]:
+            segment = segment.encode("ascii", errors="ignore").decode("ascii")
+
+            # Normalize node IDs in declarations: avoid dashes/spaces.
+            segment = re.sub(
+                r"^([A-Za-z_][A-Za-z0-9 _-]*)(\s*(?:\[|\(|\{))",
+                lambda m: re.sub(r"[^A-Za-z0-9_]", "_", m.group(1)) + m.group(2),
+                segment,
+            )
+
+            # Quote labels inside square brackets to avoid parser issues with symbols.
+            segment = re.sub(
+                r"([A-Za-z_][A-Za-z0-9_]*)\[(.*?)\]",
+                lambda m: f'{m.group(1)}["{m.group(2).replace(chr(34), chr(39))}"]',
+                segment,
+            )
+
+            normalized.append(segment)
+
+    if not has_flow_header:
+        normalized.insert(0, "flowchart LR")
+
+    cleaned = "\n".join(normalized).strip()
+    cleaned = cleaned.encode("ascii", errors="ignore").decode("ascii")
+
+    # Reject known bad concatenations and broken/incomplete edge endings.
+    if re.search(r"(\[[^\]]*\]|\([^)]+\)|\{[^}]+\}|\"[^\"]*\")\s*[A-Za-z_][A-Za-z0-9_]*\s*(?:-->|-\.->|==>)", cleaned):
+        return ""
+    if re.search(r"(?:-->|-\.->|==>)\s*$", cleaned, flags=re.MULTILINE):
+        return ""
+    if re.search(r"(?:--|==|-\.->|->)\s*$", cleaned, flags=re.MULTILINE):
+        return ""
+
+    # Hard validation heuristics: reject clearly malformed structures.
+    malformed_pattern = r"\[[^\]]*\]\s+[A-Za-z_][A-Za-z0-9_]*(?:\[|\(|\{)"
+    if re.search(malformed_pattern, cleaned):
+        return ""
+
+    # Ensure this is a connected graph, not a loose list of nodes.
+    if "-->" not in cleaned and "-.->" not in cleaned and "==>" not in cleaned:
+        return ""
+
+    edge_pattern = re.compile(
+        r'^[A-Za-z_][A-Za-z0-9_]*(?:\["[^"]*"\]|\([^)]+\)|\{[^}]+\})?\s*'
+        r'(?:-->|-\.->|==>)\s*'
+        r'[A-Za-z_][A-Za-z0-9_]*(?:\["[^"]*"\]|\([^)]+\)|\{[^}]+\})?$'
+    )
+    node_pattern = re.compile(
+        r'^[A-Za-z_][A-Za-z0-9_]*(?:\["[^"]*"\]|\([^)]+\)|\{[^}]+\})$'
+    )
+
+    for line in cleaned.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.lower().startswith("flowchart "):
+            continue
+        if line.startswith("%%"):
+            continue
+        if re.search(r"[^\x20-\x7E]", line):
+            return ""
+        if not edge_pattern.match(line) and not node_pattern.match(line):
+            return ""
+
+    return cleaned
+
+def _default_mermaid_template() -> str:
+    return (
+        "flowchart LR\n"
+        'User["Users"] --> DNS["Route 53"]\n'
+        'DNS --> ALB["Application Load Balancer"]\n'
+        'ALB --> APP["AWS Compute (ECS or Lambda)"]\n'
+        'APP --> DB["Amazon RDS"]\n'
+        'APP --> OBJ["Amazon S3"]\n'
+        'APP --> OBS["CloudWatch"]\n'
+    )
+
+def _generate_mermaid_fallback_diagram(payload, failure_reason="") -> str:
+    """
+    Fallback path used when MCP/uvx diagram rendering is unavailable.
+    Generates Mermaid code with Nova and returns a hosted Mermaid image URL.
+    """
+    mermaid_code = ""
+    try:
+        bedrock_client = boto3.client(
+            "bedrock-runtime",
+            region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+        )
+        prompt = f"""
+Create Mermaid syntax for an AWS architecture diagram.
+Return ONLY Mermaid code. No markdown fences. No explanation.
+Use flowchart LR.
+Rules:
+- One statement per line.
+- Never place two node declarations on the same line unless connected by an arrow.
+- Use node IDs with letters/numbers/underscores only.
+- Prefer labels quoted in square brackets, for example: EC2_1["Web Server 1"].
+
+User request:
+{payload}
+""".strip()
+
+        response = bedrock_client.invoke_model(
+            modelId="us.amazon.nova-pro-v1:0",
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps(
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [{"text": prompt}]
+                        }
+                    ],
+                    "inferenceConfig": {"max_new_tokens": 900, "temperature": 0.2}
+                }
+            ),
+        )
+        result = json.loads(response["body"].read())
+        text = (
+            result.get("output", {})
+            .get("message", {})
+            .get("content", [{}])[0]
+            .get("text", "")
+        )
+        mermaid_code = _extract_mermaid_code(text)
+    except Exception as e:
+        logger.warning(f"Mermaid fallback generation via Nova failed: {e}")
+
+    if not mermaid_code:
+        logger.warning("Generated Mermaid code failed validation. Using default template.")
+        mermaid_code = _default_mermaid_template()
+
+    encoded = base64.urlsafe_b64encode(mermaid_code.encode("utf-8")).decode("utf-8")
+    mermaid_image_url = f"https://mermaid.ink/img/{encoded}"
+
+    reason_prefix = ""
+    if failure_reason:
+        reason_prefix = f"Native diagram renderer unavailable ({failure_reason}). Showing Mermaid fallback.\n\n"
+
+    return (
+        f"{reason_prefix}"
+        f"### Generated Architecture Diagram:\n\n"
+        f"![Architecture Diagram]({mermaid_image_url})\n\n"
+        "<details><summary>View Mermaid source</summary>\n\n"
+        "```mermaid\n"
+        f"{mermaid_code}\n"
+        "```\n"
+        "</details>"
+    )
+
 @tool
 def arch_diag_assistant(payload):
     """
@@ -308,134 +517,162 @@ def arch_diag_assistant(payload):
     Creates PNG architecture diagrams using AWS Diagram MCP server.
     """
     print(f"arch_diag_assistant called with payload: {payload}")
-    
-    # Connect to AWS Diagram MCP server
-    # REQUIRES: uvx installed on system
-    diagram_mcp_client = MCPClient(
-        lambda: stdio_client(
-            StdioServerParameters(
-                command="uvx",
-                args=[
+    try:
+        uvx_path = shutil.which("uvx")
+        if uvx_path:
+            diagram_command = uvx_path
+            diagram_args = [
+                "--with", "jschema-to-python",
+                "awslabs.aws-diagram-mcp-server@latest"
+            ]
+        else:
+            try:
+                import uv  # noqa: F401
+                diagram_command = sys.executable
+                diagram_args = [
+                    "-m", "uv", "tool", "run",
                     "--with", "jschema-to-python",
                     "awslabs.aws-diagram-mcp-server@latest"
                 ]
+            except Exception:
+                raise RuntimeError("uvx binary not found in runtime and `uv` module is unavailable")
+
+        diagram_mcp_client = MCPClient(
+            lambda: stdio_client(
+                StdioServerParameters(
+                    command=diagram_command,
+                    args=diagram_args
+                )
             )
         )
-    )
-    
-    print("Initializing architecture diagram agent...")
-    
-    with diagram_mcp_client:
-        diagram_tools = diagram_mcp_client.list_tools_sync()
         
-        # Internal Agent to drive the Diagram Tools
-        bedrock_client = boto3.client('bedrock-runtime', region_name='us-east-1')
+        print("Initializing architecture diagram agent...")
         
-        agent = Agent(
-            model="us.amazon.nova-pro-v1:0",
-            tools=diagram_tools,
-            system_prompt="""You are a Senior AWS Solutions Architect.
-            Create professional AWS architecture diagrams.
-            - Use generate_diagram tool ONCE.
-            - Follow AWS Well-Architected Framework.
-            - Generate only ONE diagram per request.
-            """
-        )
-        
-        response = agent(payload)
-        
-        # Extract Images
-        text_parts = []
-        saved_images = []
-        
-        # Cloud Storage Configuration
-        bucket_name = os.getenv("DIAGRAM_BUCKET_NAME")
-        s3_client = boto3.client('s3') if bucket_name else None
-        
-        # Local fallback (for /tmp scanning)
-        tmp_diagram_dir = Path("/tmp/generated-diagrams")
-        if not tmp_diagram_dir.exists(): 
-             tmp_diagram_dir.mkdir(parents=True, exist_ok=True)
+        with diagram_mcp_client:
+            diagram_tools = diagram_mcp_client.list_tools_sync()
+            
+            agent = Agent(
+                model="us.amazon.nova-pro-v1:0",
+                tools=diagram_tools,
+                system_prompt="""You are a Senior AWS Solutions Architect.
+                Create professional AWS architecture diagrams.
+                - Use generate_diagram tool ONCE.
+                - Follow AWS Well-Architected Framework.
+                - Generate only ONE diagram per request.
+                """
+            )
+            
+            response = agent(payload)
+            
+            # Extract Images
+            text_parts = []
+            saved_images = []
+            
+            # Cloud Storage Configuration
+            bucket_name = os.getenv("DIAGRAM_BUCKET_NAME")
+            s3_client = boto3.client('s3') if bucket_name else None
+            
+            # Local fallback (for /tmp scanning)
+            tmp_diagram_dir = Path("/tmp/generated-diagrams")
+            if not tmp_diagram_dir.exists(): 
+                 tmp_diagram_dir.mkdir(parents=True, exist_ok=True)
 
-        frontend_dir = Path("../migration_agent_frontend/public/diagrams")
-        # Only try to create frontend dir if running locally and folder structure exists
-        is_local_dev = frontend_dir.parent.exists()
-        if is_local_dev:
-            frontend_dir.mkdir(parents=True, exist_ok=True)
+            # Local fallback locations:
+            # 1) Container runtime: /app/static/diagrams (served by nginx root /app/static)
+            # 2) Local dev: ../frontend/public/diagrams (served by Vite static public directory)
+            local_diagram_dir = None
+            local_candidates = [
+                Path(SCRIPT_DIR) / "static" / "diagrams",
+                Path(SCRIPT_DIR).parent / "frontend" / "public" / "diagrams",
+            ]
+            for candidate in local_candidates:
+                if candidate.parent.exists():
+                    candidate.mkdir(parents=True, exist_ok=True)
+                    local_diagram_dir = candidate
+                    break
 
-        def save_generated_image(image_bytes, ext="png"):
-            fname = f"diagram_{uuid4().hex[:8]}_{int(time.time())}.{ext}"
-            
-            # 1. Upload to S3 (Priority for Cloud)
-            if bucket_name:
-                try:
-                    s3_key = f"diagrams/{fname}"
-                    s3_client.put_object(
-                        Bucket=bucket_name,
-                        Key=s3_key,
-                        Body=image_bytes,
-                        ContentType=f"image/{ext}"
-                    )
-                    # Generate Presigned URL (valid for 1 hour)
-                    url = s3_client.generate_presigned_url(
-                        'get_object',
-                        Params={'Bucket': bucket_name, 'Key': s3_key},
-                        ExpiresIn=3600
-                    )
-                    print(f"[SUCCESS] Uploaded diagram to s3://{bucket_name}/{s3_key}")
-                    return url
-                except Exception as e:
-                    print(f"[WARNING] Failed to upload to S3: {e}")
-            
-            # 2. Local Fallback
-            if is_local_dev:
-                dest = frontend_dir / fname
-                with open(dest, "wb") as f:
-                    f.write(image_bytes)
-                print(f"[SUCCESS] Saved diagram locally to {dest}")
-                return f"/diagrams/{fname}"
-            
-            return None
+            def save_generated_image(image_bytes, ext="png"):
+                fname = f"diagram_{uuid4().hex[:8]}_{int(time.time())}.{ext}"
+                
+                # 1. Upload to S3 (Priority for Cloud)
+                if bucket_name:
+                    try:
+                        s3_key = f"diagrams/{fname}"
+                        s3_client.put_object(
+                            Bucket=bucket_name,
+                            Key=s3_key,
+                            Body=image_bytes,
+                            ContentType=f"image/{ext}"
+                        )
+                        # Generate Presigned URL (valid for 1 hour)
+                        url = s3_client.generate_presigned_url(
+                            'get_object',
+                            Params={'Bucket': bucket_name, 'Key': s3_key},
+                            ExpiresIn=3600
+                        )
+                        print(f"[SUCCESS] Uploaded diagram to s3://{bucket_name}/{s3_key}")
+                        return url
+                    except Exception as e:
+                        print(f"[WARNING] Failed to upload to S3: {e}")
+                
+                # 2. Local Fallback
+                if local_diagram_dir:
+                    dest = local_diagram_dir / fname
+                    with open(dest, "wb") as f:
+                        f.write(image_bytes)
+                    print(f"[SUCCESS] Saved diagram locally to {dest}")
+                    return f"/diagrams/{fname}"
+                
+                return None
 
-        for part in response.message.get("content", []):
-            if part.get("type") == "text":
-                text_parts.append(part["text"])
-            
-            # Handle Base64 Image (if returned)
-            b64_data = part.get("data") or part.get("base64_data")
-            if b64_data:
-                try:
-                    image_bytes = base64.b64decode(b64_data)
-                    ext = (part.get("format") or "png").replace(".", "")
-                    url = save_generated_image(image_bytes, ext)
-                    if url:
-                        saved_images.append(url)
-                except Exception as e:
-                    print(f"Failed to process image data: {e}")
-        
-        # CHECK TMP DIR (Hybrid Fallback)
-        if tmp_diagram_dir.exists():
-            for tmp_file in tmp_diagram_dir.glob("*.png"):
-                try:
-                    with open(tmp_file, "rb") as f:
-                        image_bytes = f.read()
-                    
-                    url = save_generated_image(image_bytes, "png")
-                    if url:
-                        saved_images.append(url)
-                    
-                    # Cleanup tmp
-                    os.remove(tmp_file) 
-                except Exception as e:
-                    print(f"Failed to process tmp file {tmp_file}: {e}")
+            for part in response.message.get("content", []):
+                if not isinstance(part, dict):
+                    continue
 
-        result = "\n\n".join(text_parts).strip()
-        if saved_images:
-            result += "\n\n### Generated Architecture Diagram:\n"
-            for img_path in saved_images:
-               result += f"\n![Architecture Diagram]({img_path})\n"
+                if part.get("type") == "text":
+                    text_parts.append(part["text"])
+                
+                # Handle Base64 Image (if returned)
+                b64_data = part.get("data") or part.get("base64_data")
+                if b64_data:
+                    try:
+                        image_bytes = base64.b64decode(b64_data)
+                        ext = (part.get("format") or "png").replace(".", "").lower()
+                        if "/" in ext:
+                            ext = ext.split("/")[-1]
+                        url = save_generated_image(image_bytes, ext)
+                        if url:
+                            saved_images.append(url)
+                    except Exception as e:
+                        print(f"Failed to process image data: {e}")
             
-        return result
+            # CHECK TMP DIR (Hybrid Fallback)
+            if tmp_diagram_dir.exists():
+                for tmp_file in tmp_diagram_dir.glob("*.png"):
+                    try:
+                        with open(tmp_file, "rb") as f:
+                            image_bytes = f.read()
+                        
+                        url = save_generated_image(image_bytes, "png")
+                        if url:
+                            saved_images.append(url)
+                        
+                        # Cleanup tmp
+                        os.remove(tmp_file) 
+                    except Exception as e:
+                        print(f"Failed to process tmp file {tmp_file}: {e}")
+
+            result = "\n\n".join(text_parts).strip()
+            if saved_images:
+                result += "\n\n### Generated Architecture Diagram:\n"
+                for img_path in saved_images:
+                   result += f"\n![Architecture Diagram]({img_path})\n"
+                return result
+
+            raise RuntimeError("Diagram MCP tool completed but did not return any image bytes.")
+    except Exception as e:
+        logger.warning(f"arch_diag_assistant failed, using Mermaid fallback: {e}")
+        return _generate_mermaid_fallback_diagram(payload, str(e))
 
 # --- Define Remote Tools Stubs ---
 # These look local to the Agent, but execute remotely.
@@ -482,6 +719,7 @@ Your goal is to guide users through the complex process of migrating on-premises
 ### Operational Rules
 *   **Step-by-Step Approach**: Break complex migrations into logical phases.
 *   **Diagram Generation**: Use the `arch_diag_assistant` to create professional diagrams.
+*   **Diagram Edits**: If the user asks to modify/update/redraw/enhance an architecture diagram (including adding AWS icons), you **MUST** call `arch_diag_assistant` and return a diagram image link.
 *   **CRITICAL - Image Links**: If a tool (like `arch_diag_assistant`) returns a Markdown Image Link (e.g., `![Architecture Diagram](/diagrams/...)`), you **MUST** include this link **VERBATIM** in your final response. **Do NOT remove it**. It is required for the user to see the diagram.
 *   **Tone**: Professional, encouraging, and technically precise.
 
@@ -492,6 +730,79 @@ You have access to a suite of tools, some running on a remote Gateway and some l
 
 Use them seamlessly to assist the user.
 """
+
+def _is_diagram_or_image_request(user_text: str) -> bool:
+    text = (user_text or "").lower()
+    diagram_keywords = [
+        "diagram",
+        "draw",
+        "redraw",
+        "modify diagram",
+        "update diagram",
+        "generate image",
+        "architecture image",
+        "architecture diagram",
+        "flowchart",
+        "visual",
+        "aws icon",
+        "icons",
+        "png",
+        "hld",
+        "lld",
+    ]
+    return any(keyword in text for keyword in diagram_keywords)
+
+def _is_diagram_generation_request(user_text: str) -> bool:
+    text = (user_text or "").lower()
+    generation_words = [
+        "generate", "create", "draw", "build", "produce",
+        "modify", "update", "redraw", "revise", "enhance", "add", "convert"
+    ]
+    diagram_words = ["diagram", "architecture", "image", "visual", "flowchart", "png", "icon", "icons"]
+    return any(word in text for word in generation_words) and any(word in text for word in diagram_words)
+
+def _contains_markdown_image(text: str) -> bool:
+    return bool(re.search(r"!\[[^\]]*\]\([^)]+\)", text or ""))
+
+def _looks_like_diagram_refusal(text: str) -> bool:
+    response = (text or "").lower()
+    refusal_patterns = [
+        "cannot directly modify",
+        "can't directly modify",
+        "cannot modify the diagram",
+        "i cannot directly",
+        "i can provide guidance",
+        "unable to generate",
+        "unable to create a diagram",
+    ]
+    return any(pattern in response for pattern in refusal_patterns)
+
+def invoke_local_migration_agent(prompt_text: str) -> str:
+    """Run local Strands orchestration with both remote and local tools enabled."""
+    all_tools = [
+        cost_assistant,
+        aws_docs_assistant,
+        vpc_subnet_calculator,
+        hld_lld_input_agent,
+        arch_diag_assistant
+    ]
+    migration_agent = Agent(
+        model="us.amazon.nova-pro-v1:0",
+        system_prompt=migration_system_prompt,
+        tools=all_tools
+    )
+    response = migration_agent(prompt_text)
+
+    content = response.message.get("content", []) if getattr(response, "message", None) else []
+    text_parts = []
+    for part in content:
+        if isinstance(part, dict) and part.get("text"):
+            text_parts.append(part["text"])
+        elif isinstance(part, str):
+            text_parts.append(part)
+
+    extracted = "\n".join(text_parts).strip()
+    return extracted or str(response)
 
 def invoke_bedrock_agent_runtime(prompt_text, session_id):
     """
@@ -570,6 +881,7 @@ async def migration_assistant(payload):
         user_input = payload.get("input") or payload.get("prompt")
         user_id = payload.get("user_id", "unknown")
         context = payload.get("context", {}) 
+    user_input = user_input or ""
     import traceback
     
     # Session Management
@@ -613,28 +925,40 @@ Current User Input:
     else:
         CURRENT_IMAGE_CONTEXT["payload"] = None
 
-    try:
-        # Primary path: managed Bedrock Agent Runtime (created by Terraform)
-        loop = asyncio.get_running_loop()
-        response_text = await loop.run_in_executor(None, invoke_bedrock_agent_runtime, user_input, session_id)
+    needs_local_tools = bool(image_data) or _is_diagram_or_image_request(original_user_input)
+    wants_diagram_generation = _is_diagram_generation_request(original_user_input)
 
-        # Fallback path: local Strands orchestration if Bedrock Agent env is not configured
-        if not response_text:
-            logger.warning("Falling back to local Strands agent execution (Bedrock Agent Runtime unavailable).")
-            all_tools = [
-                cost_assistant,
-                aws_docs_assistant, 
-                vpc_subnet_calculator,
-                hld_lld_input_agent,
-                arch_diag_assistant
-            ]
-            migration_agent = Agent(
-                model="us.amazon.nova-pro-v1:0",
-                system_prompt=migration_system_prompt,
-                tools=all_tools
-            )
-            response = await loop.run_in_executor(None, migration_agent, user_input)
-            response_text = response.message['content'][0]['text']
+    try:
+        loop = asyncio.get_running_loop()
+        response_text = None
+
+        # Diagram/image tasks require local-only tools, so route these directly.
+        if needs_local_tools:
+            logger.info("Routing request to local Strands orchestration for diagram/image workflow.")
+            response_text = await loop.run_in_executor(None, invoke_local_migration_agent, user_input)
+        else:
+            # Primary path: managed Bedrock Agent Runtime (created by Terraform)
+            response_text = await loop.run_in_executor(None, invoke_bedrock_agent_runtime, user_input, session_id)
+
+            # Fallback path: local Strands orchestration if managed agent is unavailable
+            if not response_text:
+                logger.warning("Falling back to local Strands agent execution (Bedrock Agent Runtime unavailable).")
+                response_text = await loop.run_in_executor(None, invoke_local_migration_agent, user_input)
+
+        # Safety: if a diagram/image request somehow returned no image link, try local toolchain once.
+        if wants_diagram_generation and not _contains_markdown_image(response_text):
+            logger.warning("No image link detected in response. Re-trying locally to force diagram generation.")
+            response_text = await loop.run_in_executor(None, invoke_local_migration_agent, user_input)
+
+        # Hard fallback: if still no image for a diagram generation/edit request, invoke diagram tool directly.
+        if needs_local_tools and wants_diagram_generation and not _contains_markdown_image(response_text):
+            if _looks_like_diagram_refusal(response_text):
+                logger.warning("Diagram refusal detected. Invoking arch_diag_assistant directly.")
+            else:
+                logger.warning("No image after retries for diagram task. Invoking arch_diag_assistant directly.")
+            direct_diagram = await loop.run_in_executor(None, arch_diag_assistant, original_user_input)
+            if direct_diagram:
+                response_text = direct_diagram
         
         # 2. Save Interaction to Memory
         add_to_memory(session_id, "user", original_user_input)
