@@ -329,7 +329,8 @@ def _sanitize_mermaid_code(code: str) -> str:
     has_flow_header = False
 
     for raw_line in lines:
-        line = raw_line.replace("\t", " ")
+        line = raw_line.encode("ascii", errors="ignore").decode("ascii")
+        line = line.replace("\t", " ")
         line = re.sub(r"\s{2,}", " ", line).strip()
 
         # Remove accidental markdown fences if present.
@@ -350,8 +351,17 @@ def _sanitize_mermaid_code(code: str) -> str:
             r"\1\n\2",
             line,
         )
+        # Split accidentally concatenated edge statements like:
+        # DB["Amazon RDS"]APP --> OBJ["Amazon S3"]
+        line = re.sub(
+            r"(\[[^\]]*\]|\([^)]+\)|\{[^}]+\}|\"[^\"]*\")\s*([A-Za-z_][A-Za-z0-9_]*\s*(?:-->|-.->|==>))",
+            r"\1\n\2",
+            line,
+        )
 
         for segment in [seg.strip() for seg in line.split("\n") if seg.strip()]:
+            segment = segment.encode("ascii", errors="ignore").decode("ascii")
+
             # Normalize node IDs in declarations: avoid dashes/spaces.
             segment = re.sub(
                 r"^([A-Za-z_][A-Za-z0-9 _-]*)(\s*(?:\[|\(|\{))",
@@ -372,6 +382,15 @@ def _sanitize_mermaid_code(code: str) -> str:
         normalized.insert(0, "flowchart LR")
 
     cleaned = "\n".join(normalized).strip()
+    cleaned = cleaned.encode("ascii", errors="ignore").decode("ascii")
+
+    # Reject known bad concatenations and broken/incomplete edge endings.
+    if re.search(r"(\[[^\]]*\]|\([^)]+\)|\{[^}]+\}|\"[^\"]*\")\s*[A-Za-z_][A-Za-z0-9_]*\s*(?:-->|-.->|==>)", cleaned):
+        return ""
+    if re.search(r"(?:-->|-.->|==>)\s*$", cleaned, flags=re.MULTILINE):
+        return ""
+    if re.search(r"(?:--|==|-\.->|->)\s*$", cleaned, flags=re.MULTILINE):
+        return ""
 
     # Hard validation heuristics: reject clearly malformed structures.
     malformed_pattern = r"\[[^\]]*\]\s+[A-Za-z_][A-Za-z0-9_]*(?:\[|\(|\{)"
@@ -381,6 +400,28 @@ def _sanitize_mermaid_code(code: str) -> str:
     # Ensure this is a connected graph, not a loose list of nodes.
     if "-->" not in cleaned and "-.->" not in cleaned and "==>" not in cleaned:
         return ""
+
+    edge_pattern = re.compile(
+        r'^[A-Za-z_][A-Za-z0-9_]*(?:\["[^"]*"\]|\([^)]+\)|\{[^}]+\})?\s*'
+        r'(?:-->|-.->|==>)\s*'
+        r'[A-Za-z_][A-Za-z0-9_]*(?:\["[^"]*"\]|\([^)]+\)|\{[^}]+\})?$'
+    )
+    node_pattern = re.compile(
+        r'^[A-Za-z_][A-Za-z0-9_]*(?:\["[^"]*"\]|\([^)]+\)|\{[^}]+\})$'
+    )
+
+    for line in cleaned.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.lower().startswith("flowchart "):
+            continue
+        if line.startswith("%%"):
+            continue
+        if re.search(r"[^\x20-\x7E]", line):
+            return ""
+        if not edge_pattern.match(line) and not node_pattern.match(line):
+            return ""
 
     return cleaned
 
