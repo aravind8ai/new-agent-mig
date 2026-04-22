@@ -13,3 +13,4 @@ bedrock-agentcore-starter-toolkit
 requests-aws4auth
 aiofiles
 mangum
+uv>=0.5.0

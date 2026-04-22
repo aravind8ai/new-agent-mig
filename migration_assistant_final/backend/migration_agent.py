@@ -6,6 +6,7 @@ import logging
 import json
 import re
 import shutil
+import sys
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 # Load environment variables
@@ -309,22 +310,89 @@ def _extract_mermaid_code(text: str) -> str:
 
     code_match = re.search(r"```(?:mermaid)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
     code = code_match.group(1).strip() if code_match else text.strip()
-    code = "\n".join(line.rstrip() for line in code.splitlines() if line.strip())
+    code = "\n".join(line.strip() for line in code.splitlines() if line.strip())
     if not code:
         return ""
     if not code.lower().startswith(("graph ", "flowchart ")):
         code = "flowchart LR\n" + code
-    return code
+    return _sanitize_mermaid_code(code)
+
+def _sanitize_mermaid_code(code: str) -> str:
+    """
+    Best-effort cleanup for Nova-generated Mermaid to avoid parser errors.
+    """
+    lines = [line.strip() for line in code.splitlines() if line.strip()]
+    if not lines:
+        return ""
+
+    normalized = []
+    has_flow_header = False
+
+    for raw_line in lines:
+        line = raw_line.replace("\t", " ")
+        line = re.sub(r"\s{2,}", " ", line).strip()
+
+        # Remove accidental markdown fences if present.
+        if line.startswith("```"):
+            continue
+
+        # Keep only one explicit graph header.
+        if line.lower().startswith(("flowchart ", "graph ")):
+            if not has_flow_header:
+                normalized.append("flowchart LR")
+                has_flow_header = True
+            continue
+
+        # Split accidentally concatenated node declarations like:
+        # EC2_1[Web 1] EC2_2[Web 2]
+        line = re.sub(
+            r"(\[[^\]]*\]|\([^)]+\)|\{[^}]+\})\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?=\[|\(|\{)",
+            r"\1\n\2",
+            line,
+        )
+
+        for segment in [seg.strip() for seg in line.split("\n") if seg.strip()]:
+            # Normalize node IDs in declarations: avoid dashes/spaces.
+            segment = re.sub(
+                r"^([A-Za-z_][A-Za-z0-9 _-]*)(\s*(?:\[|\(|\{))",
+                lambda m: re.sub(r"[^A-Za-z0-9_]", "_", m.group(1)) + m.group(2),
+                segment,
+            )
+
+            # Quote labels inside square brackets to avoid parser issues with symbols.
+            segment = re.sub(
+                r"([A-Za-z_][A-Za-z0-9_]*)\[(.*?)\]",
+                lambda m: f'{m.group(1)}["{m.group(2).replace(chr(34), chr(39))}"]',
+                segment,
+            )
+
+            normalized.append(segment)
+
+    if not has_flow_header:
+        normalized.insert(0, "flowchart LR")
+
+    cleaned = "\n".join(normalized).strip()
+
+    # Hard validation heuristics: reject clearly malformed structures.
+    malformed_pattern = r"\[[^\]]*\]\s+[A-Za-z_][A-Za-z0-9_]*(?:\[|\(|\{)"
+    if re.search(malformed_pattern, cleaned):
+        return ""
+
+    # Ensure this is a connected graph, not a loose list of nodes.
+    if "-->" not in cleaned and "-.->" not in cleaned and "==>" not in cleaned:
+        return ""
+
+    return cleaned
 
 def _default_mermaid_template() -> str:
     return (
         "flowchart LR\n"
-        "User[Users] --> DNS[Route 53]\n"
-        "DNS --> ALB[Application Load Balancer]\n"
-        "ALB --> APP[AWS Compute\\n(ECS or Lambda)]\n"
-        "APP --> DB[(Amazon RDS)]\n"
-        "APP --> OBJ[(Amazon S3)]\n"
-        "APP --> OBS[CloudWatch]\n"
+        'User["Users"] --> DNS["Route 53"]\n'
+        'DNS --> ALB["Application Load Balancer"]\n'
+        'ALB --> APP["AWS Compute (ECS or Lambda)"]\n'
+        'APP --> DB["Amazon RDS"]\n'
+        'APP --> OBJ["Amazon S3"]\n'
+        'APP --> OBS["CloudWatch"]\n'
     )
 
 def _generate_mermaid_fallback_diagram(payload, failure_reason="") -> str:
@@ -342,6 +410,11 @@ def _generate_mermaid_fallback_diagram(payload, failure_reason="") -> str:
 Create Mermaid syntax for an AWS architecture diagram.
 Return ONLY Mermaid code. No markdown fences. No explanation.
 Use flowchart LR.
+Rules:
+- One statement per line.
+- Never place two node declarations on the same line unless connected by an arrow.
+- Use node IDs with letters/numbers/underscores only.
+- Prefer labels quoted in square brackets, for example: EC2_1["Web Server 1"].
 
 User request:
 {payload}
@@ -375,6 +448,7 @@ User request:
         logger.warning(f"Mermaid fallback generation via Nova failed: {e}")
 
     if not mermaid_code:
+        logger.warning("Generated Mermaid code failed validation. Using default template.")
         mermaid_code = _default_mermaid_template()
 
     encoded = base64.urlsafe_b64encode(mermaid_code.encode("utf-8")).decode("utf-8")
@@ -404,17 +478,29 @@ def arch_diag_assistant(payload):
     print(f"arch_diag_assistant called with payload: {payload}")
     try:
         uvx_path = shutil.which("uvx")
-        if not uvx_path:
-            raise RuntimeError("uvx binary not found in runtime")
+        if uvx_path:
+            diagram_command = uvx_path
+            diagram_args = [
+                "--with", "jschema-to-python",
+                "awslabs.aws-diagram-mcp-server@latest"
+            ]
+        else:
+            try:
+                import uv  # noqa: F401
+                diagram_command = sys.executable
+                diagram_args = [
+                    "-m", "uv", "tool", "run",
+                    "--with", "jschema-to-python",
+                    "awslabs.aws-diagram-mcp-server@latest"
+                ]
+            except Exception:
+                raise RuntimeError("uvx binary not found in runtime and `uv` module is unavailable")
 
         diagram_mcp_client = MCPClient(
             lambda: stdio_client(
                 StdioServerParameters(
-                    command=uvx_path,
-                    args=[
-                        "--with", "jschema-to-python",
-                        "awslabs.aws-diagram-mcp-server@latest"
-                    ]
+                    command=diagram_command,
+                    args=diagram_args
                 )
             )
         )
