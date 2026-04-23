@@ -299,10 +299,11 @@ from mcp import StdioServerParameters, stdio_client
 
 # Directory for storing generated diagrams
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-# Point to frontend public dir so they are accessible? 
-# or just a local folder and we serve it. For now local folder.
 DIAGRAM_OUTPUT_DIR = Path(os.path.join(SCRIPT_DIR, "generated-diagrams"))
 DIAGRAM_OUTPUT_DIR.mkdir(exist_ok=True)
+
+# Log S3 bucket config at startup so it's visible in ECS/supervisord logs
+logger.info(f"[Config] DIAGRAM_BUCKET_NAME = {os.getenv('DIAGRAM_BUCKET_NAME', '<not set — will use local storage>')}")
 
 def _extract_mermaid_code(text: str) -> str:
     if not text:
@@ -530,7 +531,7 @@ def _generate_diagrams_fallback(payload: str, failure_reason: str = "") -> str:
 
 
 def _save_diagram_image(image_bytes: bytes, ext: str = "png") -> str | None:
-    """Saves image bytes to S3 or local static dir, returns URL."""
+    """Saves image bytes to S3 (primary) or local static dir (fallback), returns URL."""
     fname = f"diagram_{uuid4().hex[:8]}_{int(time.time())}.{ext}"
     bucket_name = os.getenv("DIAGRAM_BUCKET_NAME")
 
@@ -538,10 +539,24 @@ def _save_diagram_image(image_bytes: bytes, ext: str = "png") -> str | None:
         try:
             s3_client = boto3.client("s3")
             s3_key = f"diagrams/{fname}"
-            s3_client.put_object(Bucket=bucket_name, Key=s3_key, Body=image_bytes, ContentType=f"image/{ext}")
-            return s3_client.generate_presigned_url("get_object", Params={"Bucket": bucket_name, "Key": s3_key}, ExpiresIn=3600)
+            s3_client.put_object(
+                Bucket=bucket_name,
+                Key=s3_key,
+                Body=image_bytes,
+                ContentType=f"image/{ext}",
+            )
+            url = s3_client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": bucket_name, "Key": s3_key},
+                ExpiresIn=3600,
+            )
+            logger.info(f"[S3] Diagram uploaded: s3://{bucket_name}/{s3_key}")
+            return url
         except Exception as e:
-            logger.warning(f"S3 upload failed: {e}")
+            logger.error(f"[S3] Upload failed for bucket '{bucket_name}': {e}")
+            # Fall through to local storage
+    else:
+        logger.warning("[S3] DIAGRAM_BUCKET_NAME not set — falling back to local storage.")
 
     local_candidates = [
         Path(SCRIPT_DIR) / "static" / "diagrams",
@@ -553,8 +568,10 @@ def _save_diagram_image(image_bytes: bytes, ext: str = "png") -> str | None:
             dest = candidate / fname
             with open(dest, "wb") as f:
                 f.write(image_bytes)
+            logger.info(f"[Local] Diagram saved: {dest}")
             return f"/diagrams/{fname}"
 
+    logger.error("[Save] No valid storage location found for diagram.")
     return None
 
 
@@ -763,10 +780,13 @@ def _is_diagram_or_image_request(user_text: str) -> bool:
 def _is_diagram_generation_request(user_text: str) -> bool:
     text = (user_text or "").lower()
     generation_words = [
-        "generate", "create", "draw", "build", "produce",
-        "modify", "update", "redraw", "revise", "enhance", "add", "convert"
+        "generate", "create", "draw", "build", "produce", "show",
+        "modify", "update", "redraw", "revise", "enhance", "add", "convert", "make", "give me"
     ]
-    diagram_words = ["diagram", "architecture", "image", "visual", "flowchart", "png", "icon", "icons"]
+    diagram_words = [
+        "diagram", "architecture", "image", "visual", "flowchart",
+        "png", "icon", "icons", "architecture diagram", "aws diagram"
+    ]
     return any(word in text for word in generation_words) and any(word in text for word in diagram_words)
 
 def _contains_markdown_image(text: str) -> bool:
@@ -960,10 +980,17 @@ async def migration_assistant(payload):
         loop = asyncio.get_running_loop()
         response_text = None
 
-        # Diagram/image tasks require local-only tools, so route these directly.
-        if needs_local_tools:
-            logger.info("Routing request to local Strands orchestration for diagram/image workflow.")
+        # For diagram generation requests, call arch_diag_assistant directly.
+        # Don't let the agent decide — it consistently picks the wrong tool.
+        if wants_diagram_generation:
+            logger.info("Diagram generation request detected — invoking arch_diag_assistant directly.")
+            response_text = await loop.run_in_executor(None, arch_diag_assistant, original_user_input)
+
+        elif needs_local_tools:
+            # Image analysis (HLD/LLD upload) — needs local agent
+            logger.info("Routing request to local Strands orchestration for image workflow.")
             response_text = await loop.run_in_executor(None, invoke_local_migration_agent, user_input)
+
         else:
             # Primary path: managed Bedrock Agent Runtime (created by Terraform)
             response_text = await loop.run_in_executor(None, invoke_bedrock_agent_runtime, user_input, session_id)
@@ -973,24 +1000,14 @@ async def migration_assistant(payload):
                 logger.warning("Falling back to local Strands agent execution (Bedrock Agent Runtime unavailable).")
                 response_text = await loop.run_in_executor(None, invoke_local_migration_agent, user_input)
 
-        # Safety: if a diagram/image request somehow returned no image link, try local toolchain once.
-        if wants_diagram_generation and not _contains_markdown_image(response_text):
-            logger.warning("No image link detected in response. Re-trying locally to force diagram generation.")
-            response_text = await loop.run_in_executor(None, invoke_local_migration_agent, user_input)
+        # If diagram was requested but no image came back, force it directly
+        if wants_diagram_generation and not _contains_markdown_image(response_text or ""):
+            logger.warning("No image in diagram response — forcing arch_diag_assistant directly.")
+            response_text = await loop.run_in_executor(None, arch_diag_assistant, original_user_input)
 
-        # Hard fallback: if still no image for a diagram generation/edit request, invoke diagram tool directly.
-        if needs_local_tools and wants_diagram_generation and not _contains_markdown_image(response_text):
-            if _looks_like_diagram_refusal(response_text):
-                logger.warning("Diagram refusal detected. Invoking arch_diag_assistant directly.")
-            else:
-                logger.warning("No image after retries for diagram task. Invoking arch_diag_assistant directly.")
-            direct_diagram = await loop.run_in_executor(None, arch_diag_assistant, original_user_input)
-            if direct_diagram:
-                response_text = direct_diagram
-
-        # 2. Save Interaction to Memory
+        # Save Interaction to Memory
         add_to_memory(session_id, "user", original_user_input)
-        add_to_memory(session_id, "assistant", response_text)
+        add_to_memory(session_id, "assistant", response_text or "")
 
         return response_text
 
@@ -1016,7 +1033,8 @@ async def migration_assistant(payload):
 
 
 if __name__ == "__main__":
-    print("\n🚀 Migration Agent Server is RUNNING on internal port 8081")
-    # Run on 8081 so Nginx can proxy to it from 8000
+    _bucket = os.getenv("DIAGRAM_BUCKET_NAME", "<not set>")
+    print(f"\n🚀 Migration Agent Server is RUNNING on internal port 8081")
+    print(f"📦 Diagram S3 bucket: {_bucket}")
     uvicorn.run(app, host="0.0.0.0", port=8081)
 
