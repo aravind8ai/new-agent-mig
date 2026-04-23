@@ -453,7 +453,7 @@ User request:
 
 def _generate_diagrams_fallback(payload: str, failure_reason: str = "") -> str:
     """
-    Fallback: asks Nova to write Python `diagrams` library code, executes it,
+    Asks Nova to write Python `diagrams` library code, executes it,
     and returns the resulting PNG as a hosted image link.
     """
     import subprocess
@@ -464,72 +464,101 @@ def _generate_diagrams_fallback(payload: str, failure_reason: str = "") -> str:
         region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
     )
 
-    code_text = ""
-    try:
+    def _ask_nova(prompt_text: str) -> str:
         response = bedrock_client.invoke_model(
             modelId="us.amazon.nova-pro-v1:0",
             contentType="application/json",
             accept="application/json",
             body=json.dumps({
-                "messages": [{"role": "user", "content": [{"text": _DIAGRAMS_PROMPT.format(payload=payload)}]}],
-                "inferenceConfig": {"max_new_tokens": 1200, "temperature": 0.2},
+                "messages": [{"role": "user", "content": [{"text": prompt_text}]}],
+                "inferenceConfig": {"max_new_tokens": 1500, "temperature": 0.2},
             }),
         )
         result = json.loads(response["body"].read())
-        code_text = result.get("output", {}).get("message", {}).get("content", [{}])[0].get("text", "")
-        # Strip markdown fences if present
-        code_match = re.search(r"```(?:python)?\s*(.*?)```", code_text, re.DOTALL | re.IGNORECASE)
-        if code_match:
-            code_text = code_match.group(1).strip()
+        raw = result.get("output", {}).get("message", {}).get("content", [{}])[0].get("text", "")
+        code_match = re.search(r"```(?:python)?\s*(.*?)```", raw, re.DOTALL | re.IGNORECASE)
+        return code_match.group(1).strip() if code_match else raw.strip()
+
+    def _enforce_single_diagram(code: str) -> str:
+        matches = list(re.finditer(r'with Diagram\(', code))
+        if len(matches) > 1:
+            logger.warning(f"Truncating {len(matches)} Diagram blocks to 1.")
+            code = code[:matches[1].start()].rstrip()
+        return code
+
+    def _run_code(code: str) -> str | None:
+        """Execute diagram code, return PNG path or None."""
+        fname = f"diagram_{uuid4().hex[:8]}_{int(time.time())}"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = os.path.join(tmpdir, fname)
+            full_code = f'OUTPUT_PATH = {repr(output_path)}\n\n{code}'
+            script_path = os.path.join(tmpdir, "gen_diagram.py")
+            with open(script_path, "w") as f:
+                f.write(full_code)
+
+            proc = subprocess.run(
+                [sys.executable, script_path],
+                capture_output=True, text=True, timeout=90,
+                env={**os.environ, "MPLBACKEND": "Agg"},
+            )
+            if proc.returncode != 0:
+                logger.warning(f"[diagrams] Script failed:\n{proc.stderr[:800]}")
+                return None, proc.stderr
+
+            png_path = output_path + ".png"
+            if not os.path.exists(png_path):
+                logger.warning(f"[diagrams] Script succeeded but no PNG at {png_path}")
+                return None, "PNG file not created"
+
+            with open(png_path, "rb") as f:
+                image_bytes = f.read()
+            return image_bytes, None
+
+    # Attempt 1: generate code from prompt
+    code_text = ""
+    try:
+        code_text = _ask_nova(_DIAGRAMS_PROMPT.format(payload=payload))
+        code_text = _enforce_single_diagram(code_text)
+        logger.info(f"[diagrams] Generated code ({len(code_text)} chars)")
     except Exception as e:
-        logger.warning(f"Nova diagram code generation failed: {e}")
+        logger.warning(f"[diagrams] Nova code generation failed: {e}")
 
     img_url = None
     if code_text:
-        # Safety: if Nova generated multiple Diagram() calls, keep only the first block
-        diagram_matches = list(re.finditer(r'with Diagram\(', code_text))
-        if len(diagram_matches) > 1:
-            logger.warning(f"Nova generated {len(diagram_matches)} Diagram blocks — truncating to first only.")
-            second_start = diagram_matches[1].start()
-            code_text = code_text[:second_start].rstrip()
+        image_bytes, err = _run_code(code_text)
 
-        try:
-            fname = f"diagram_{uuid4().hex[:8]}_{int(time.time())}"
-            with tempfile.TemporaryDirectory() as tmpdir:
-                output_path = os.path.join(tmpdir, fname)
-                # Inject OUTPUT_PATH variable before user code
-                full_code = f'OUTPUT_PATH = {repr(output_path)}\n\n{code_text}'
-                script_path = os.path.join(tmpdir, "gen_diagram.py")
-                with open(script_path, "w") as f:
-                    f.write(full_code)
+        # Attempt 2: if execution failed, ask Nova to fix the error
+        if image_bytes is None and err:
+            logger.info("[diagrams] Retrying with error-correction prompt...")
+            fix_prompt = (
+                f"The following Python `diagrams` library code failed with this error:\n\n"
+                f"ERROR:\n{err[:600]}\n\n"
+                f"CODE:\n```python\n{code_text}\n```\n\n"
+                f"Fix the code so it runs correctly. "
+                f"Use EXACTLY ONE `with Diagram(...)` block. "
+                f"OUTPUT_PATH is already defined — do not redefine it. "
+                f"Return ONLY the corrected Python code block."
+            )
+            try:
+                fixed_code = _ask_nova(fix_prompt)
+                fixed_code = _enforce_single_diagram(fixed_code)
+                image_bytes, err2 = _run_code(fixed_code)
+                if image_bytes is None:
+                    logger.warning(f"[diagrams] Error-corrected code also failed: {err2}")
+            except Exception as e:
+                logger.warning(f"[diagrams] Error-correction attempt failed: {e}")
 
-                result = subprocess.run(
-                    [sys.executable, script_path],
-                    capture_output=True, text=True, timeout=60,
-                    env={**os.environ, "MPLBACKEND": "Agg"},
-                )
-                if result.returncode != 0:
-                    logger.warning(f"diagrams script error: {result.stderr[:500]}")
-                else:
-                    png_path = output_path + ".png"
-                    if os.path.exists(png_path):
-                        with open(png_path, "rb") as f:
-                            image_bytes = f.read()
-                        img_url = _save_diagram_image(image_bytes, "png")
-        except Exception as e:
-            logger.warning(f"diagrams execution failed: {e}")
-
-    reason_prefix = f"_Primary renderer unavailable. Rendered with AWS icons via diagrams library._\n\n" if failure_reason else ""
+        if image_bytes:
+            img_url = _save_diagram_image(image_bytes, "png")
 
     if img_url:
         return (
-            f"{reason_prefix}"
             f"### Generated Architecture Diagram:\n\n"
             f"![Architecture Diagram]({img_url})\n"
         )
 
-    # Last resort: mermaid.ink
-    logger.warning("diagrams fallback failed, using mermaid.ink as last resort")
+    # Only reach mermaid if both attempts failed
+    logger.warning("[diagrams] Both attempts failed — falling back to mermaid.ink")
     return _generate_mermaid_last_resort(payload, failure_reason)
 
 
