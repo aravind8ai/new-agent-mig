@@ -14,3 +14,4 @@ requests-aws4auth
 aiofiles
 mangum
 uv>=0.5.0
+diagrams>=0.23.4

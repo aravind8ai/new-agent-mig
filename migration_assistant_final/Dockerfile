@@ -31,7 +31,7 @@ FROM python:3.11-slim
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends nginx supervisor \
+    && apt-get install -y --no-install-recommends nginx supervisor graphviz \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=pydeps /opt/venv /opt/venv

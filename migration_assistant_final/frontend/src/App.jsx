@@ -55,11 +55,16 @@ export default function App() {
       };
       if (image?.payload) body.image_base64 = image.payload;
 
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 300000); // 5 min
+
       const res = await fetch(API_ENDPOINT, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
+        signal: controller.signal,
       });
+      clearTimeout(timeoutId);
 
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`);
@@ -119,11 +124,14 @@ export default function App() {
 
       setMessages((prev) => [...prev, { role: 'assistant', content: String(assistantText) }]);
     } catch (error) {
+      const isTimeout = error.name === 'AbortError';
       setMessages((prev) => [
         ...prev,
         {
           role: 'assistant',
-          content: `Request failed: ${error.message}. Check service logs and API health.`,
+          content: isTimeout
+            ? 'The request timed out — diagram generation can take up to a few minutes. Please try again.'
+            : `Request failed: ${error.message}. Check service logs and API health.`,
         },
       ]);
     } finally {
