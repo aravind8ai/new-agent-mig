@@ -151,7 +151,7 @@ resource "aws_s3_bucket_cors_configuration" "diagrams" {
   }
 }
 
-
+resource "aws_s3_bucket_lifecycle_configuration" "diagrams" {
   bucket = aws_s3_bucket.diagrams.id
 
   rule {
