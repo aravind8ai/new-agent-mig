@@ -432,124 +432,84 @@ def _default_mermaid_template() -> str:
         'APP --> OBS["CloudWatch"]\n'
     )
 
-_DIAGRAMS_PROMPT = """You are an AWS Solutions Architect generating Python code using the `diagrams` library (https://diagrams.mingrammer.com).
+_CANVAS_PROMPT_TEMPLATE = """You are an AWS Solutions Architect. Write a detailed image generation prompt for an AWS architecture diagram.
 
-Generate a complete, runnable Python script that creates ONE single AWS architecture diagram as a PNG file containing ALL services and components mentioned in the request.
+The prompt will be sent to an AI image generator. It must describe a clean, professional, white-background AWS architecture diagram with labeled boxes for each AWS service, arrows showing data flow, and grouped sections for VPC/subnets/clusters.
 
-Rules:
-- Import ONLY from `diagrams`, `diagrams.aws.*`, and standard library modules.
-- Use EXACTLY ONE `with Diagram("...", filename=OUTPUT_PATH, show=False, direction="LR"):` block — never more than one.
-- OUTPUT_PATH is already defined as a variable — do NOT redefine it, do NOT hardcode any filename.
-- Include ALL services from the request inside this single Diagram block. Do NOT split into multiple diagrams.
-- Use real AWS service classes (e.g. `from diagrams.aws.compute import ECS, Lambda`, `from diagrams.aws.network import ALB, Route53`, `from diagrams.aws.database import RDS`, `from diagrams.aws.storage import S3`, `from diagrams.aws.security import Cognito`, `from diagrams.aws.management import Cloudwatch`, `from diagrams.aws.network import NATGateway, TransitGateway, VPCEndpoint`, `from diagrams.aws.network import Firewall`).
-- Group related services inside `with Cluster("..."):` blocks within the single Diagram.
-- Connect nodes with `>>` arrows.
-- Do NOT call `show()`, do NOT use `plt`, do NOT use subprocess, do NOT create more than one Diagram object.
-- Return ONLY the Python code block. No explanation.
+Include ALL of the following in the prompt:
+- Every AWS service mentioned in the request, with its official name label
+- Directional arrows showing the flow between services
+- Grouped sections (e.g. "VPC", "Public Subnet", "Private Subnet", "On-Premises")
+- AWS service icon colors (orange for compute, blue for networking, purple for database, green for storage)
+- Clean white background, technical diagram style, no people, no decorative elements
 
 User request:
 {payload}
-"""
+
+Return ONLY the image generation prompt text, no explanation."""
+
 
 def _generate_diagrams_fallback(payload: str, failure_reason: str = "") -> str:
     """
-    Asks Nova to write Python `diagrams` library code, executes it,
-    and returns the resulting PNG as a hosted image link.
+    Uses Nova Pro to write an image prompt, then Nova Canvas to generate the diagram PNG directly.
+    Falls back to matplotlib renderer if Canvas fails.
     """
-    import subprocess
-    import tempfile
-
     bedrock_client = boto3.client(
         "bedrock-runtime",
         region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
     )
 
-    def _ask_nova(prompt_text: str) -> str:
-        response = bedrock_client.invoke_model(
+    # Step 1: Nova Pro writes a detailed image prompt
+    image_prompt = ""
+    try:
+        resp = bedrock_client.invoke_model(
             modelId="us.amazon.nova-pro-v1:0",
             contentType="application/json",
             accept="application/json",
             body=json.dumps({
-                "messages": [{"role": "user", "content": [{"text": prompt_text}]}],
-                "inferenceConfig": {"max_new_tokens": 1500, "temperature": 0.2},
+                "messages": [{"role": "user", "content": [{"text": _CANVAS_PROMPT_TEMPLATE.format(payload=payload)}]}],
+                "inferenceConfig": {"max_new_tokens": 600, "temperature": 0.2},
             }),
         )
-        result = json.loads(response["body"].read())
-        raw = result.get("output", {}).get("message", {}).get("content", [{}])[0].get("text", "")
-        code_match = re.search(r"```(?:python)?\s*(.*?)```", raw, re.DOTALL | re.IGNORECASE)
-        return code_match.group(1).strip() if code_match else raw.strip()
-
-    def _enforce_single_diagram(code: str) -> str:
-        matches = list(re.finditer(r'with Diagram\(', code))
-        if len(matches) > 1:
-            logger.warning(f"Truncating {len(matches)} Diagram blocks to 1.")
-            code = code[:matches[1].start()].rstrip()
-        return code
-
-    def _run_code(code: str) -> str | None:
-        """Execute diagram code, return PNG path or None."""
-        fname = f"diagram_{uuid4().hex[:8]}_{int(time.time())}"
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output_path = os.path.join(tmpdir, fname)
-            full_code = f'OUTPUT_PATH = {repr(output_path)}\n\n{code}'
-            script_path = os.path.join(tmpdir, "gen_diagram.py")
-            with open(script_path, "w") as f:
-                f.write(full_code)
-
-            proc = subprocess.run(
-                [sys.executable, script_path],
-                capture_output=True, text=True, timeout=90,
-                env={**os.environ, "MPLBACKEND": "Agg"},
-            )
-            if proc.returncode != 0:
-                logger.warning(f"[diagrams] Script failed:\n{proc.stderr[:800]}")
-                return None, proc.stderr
-
-            png_path = output_path + ".png"
-            if not os.path.exists(png_path):
-                logger.warning(f"[diagrams] Script succeeded but no PNG at {png_path}")
-                return None, "PNG file not created"
-
-            with open(png_path, "rb") as f:
-                image_bytes = f.read()
-            return image_bytes, None
-
-    # Attempt 1: generate code from prompt
-    code_text = ""
-    try:
-        code_text = _ask_nova(_DIAGRAMS_PROMPT.format(payload=payload))
-        code_text = _enforce_single_diagram(code_text)
-        logger.info(f"[diagrams] Generated code ({len(code_text)} chars)")
+        result = json.loads(resp["body"].read())
+        image_prompt = result.get("output", {}).get("message", {}).get("content", [{}])[0].get("text", "").strip()
+        logger.info(f"[canvas] Image prompt generated ({len(image_prompt)} chars)")
     except Exception as e:
-        logger.warning(f"[diagrams] Nova code generation failed: {e}")
+        logger.warning(f"[canvas] Nova Pro prompt generation failed: {e}")
+        image_prompt = f"Professional AWS architecture diagram showing: {payload}. White background, labeled service boxes with arrows, technical style."
 
+    # Step 2: Nova Canvas generates the image
     img_url = None
-    if code_text:
-        image_bytes, err = _run_code(code_text)
-
-        # Attempt 2: if execution failed, ask Nova to fix the error
-        if image_bytes is None and err:
-            logger.info("[diagrams] Retrying with error-correction prompt...")
-            fix_prompt = (
-                f"The following Python `diagrams` library code failed with this error:\n\n"
-                f"ERROR:\n{err[:600]}\n\n"
-                f"CODE:\n```python\n{code_text}\n```\n\n"
-                f"Fix the code so it runs correctly. "
-                f"Use EXACTLY ONE `with Diagram(...)` block. "
-                f"OUTPUT_PATH is already defined — do not redefine it. "
-                f"Return ONLY the corrected Python code block."
-            )
-            try:
-                fixed_code = _ask_nova(fix_prompt)
-                fixed_code = _enforce_single_diagram(fixed_code)
-                image_bytes, err2 = _run_code(fixed_code)
-                if image_bytes is None:
-                    logger.warning(f"[diagrams] Error-corrected code also failed: {err2}")
-            except Exception as e:
-                logger.warning(f"[diagrams] Error-correction attempt failed: {e}")
-
-        if image_bytes:
+    try:
+        canvas_resp = bedrock_client.invoke_model(
+            modelId="amazon.nova-canvas-v1:0",
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps({
+                "taskType": "TEXT_IMAGE",
+                "textToImageParams": {
+                    "text": image_prompt,
+                    "negativeText": "people, faces, hands, text errors, blurry, low quality, decorative borders, 3D rendering",
+                },
+                "imageGenerationConfig": {
+                    "numberOfImages": 1,
+                    "width": 1280,
+                    "height": 768,
+                    "quality": "standard",
+                    "cfgScale": 8.0,
+                },
+            }),
+        )
+        canvas_result = json.loads(canvas_resp["body"].read())
+        images = canvas_result.get("images", [])
+        if images:
+            image_bytes = base64.b64decode(images[0])
             img_url = _save_diagram_image(image_bytes, "png")
+            logger.info(f"[canvas] Nova Canvas diagram saved: {img_url}")
+        else:
+            logger.warning(f"[canvas] No images returned. Error: {canvas_result.get('error')}")
+    except Exception as e:
+        logger.warning(f"[canvas] Nova Canvas generation failed: {e}")
 
     if img_url:
         return (
@@ -557,9 +517,149 @@ def _generate_diagrams_fallback(payload: str, failure_reason: str = "") -> str:
             f"![Architecture Diagram]({img_url})\n"
         )
 
-    # Only reach mermaid if both attempts failed
-    logger.warning("[diagrams] Both attempts failed — falling back to mermaid.ink")
+    # Fallback: matplotlib renderer
+    logger.warning("[canvas] Nova Canvas failed — falling back to matplotlib renderer")
+    return _render_with_matplotlib(payload, failure_reason)
+
+
+def _render_with_matplotlib(payload: str, failure_reason: str = "") -> str:
+    """Renders architecture diagram using matplotlib as last resort before mermaid."""
+    bedrock_client = boto3.client(
+        "bedrock-runtime",
+        region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+    )
+
+    _MATPLOTLIB_PROMPT = """Extract the AWS architecture from the user request and return ONLY valid JSON:
+{
+  "title": "Architecture title",
+  "clusters": [{"name": "Cluster label", "services": ["Service1", "Service2"]}],
+  "connections": [["SourceService", "TargetService"]]
+}
+Use real AWS service names. Include ALL services. No explanation.
+
+User request:
+""" + payload
+
+    arch_json = None
+    try:
+        resp = bedrock_client.invoke_model(
+            modelId="us.amazon.nova-pro-v1:0",
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps({
+                "messages": [{"role": "user", "content": [{"text": _MATPLOTLIB_PROMPT}]}],
+                "inferenceConfig": {"max_new_tokens": 800, "temperature": 0.1},
+            }),
+        )
+        raw = json.loads(resp["body"].read())
+        text = raw.get("output", {}).get("message", {}).get("content", [{}])[0].get("text", "")
+        json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        json_str = json_match.group(1) if json_match else text.strip()
+        arch_json = json.loads(json_str)
+    except Exception as e:
+        logger.warning(f"[matplotlib] JSON extraction failed: {e}")
+
+    if arch_json:
+        try:
+            image_bytes = _render_architecture_png(
+                title=arch_json.get("title", "AWS Architecture"),
+                clusters=arch_json.get("clusters", []),
+                connections=arch_json.get("connections", []),
+            )
+            img_url = _save_diagram_image(image_bytes, "png")
+            if img_url:
+                return f"### Generated Architecture Diagram:\n\n![Architecture Diagram]({img_url})\n"
+        except Exception as e:
+            logger.warning(f"[matplotlib] Render failed: {e}")
+
+    logger.warning("[matplotlib] Falling back to mermaid.ink")
     return _generate_mermaid_last_resort(payload, failure_reason)
+
+
+# AWS service color map for matplotlib renderer
+_AWS_COLORS = {
+    "default":    {"bg": "#E8F4FD", "border": "#1A73E8", "text": "#0D47A1"},
+    "compute":    {"bg": "#FFF3E0", "border": "#FF6D00", "text": "#E65100"},
+    "network":    {"bg": "#E8F5E9", "border": "#2E7D32", "text": "#1B5E20"},
+    "database":   {"bg": "#F3E5F5", "border": "#6A1B9A", "text": "#4A148C"},
+    "storage":    {"bg": "#FFF8E1", "border": "#F57F17", "text": "#E65100"},
+    "security":   {"bg": "#FCE4EC", "border": "#C62828", "text": "#B71C1C"},
+    "management": {"bg": "#E0F2F1", "border": "#00695C", "text": "#004D40"},
+}
+_SERVICE_CATEGORY = {
+    "EC2": "compute", "ECS": "compute", "ECS Fargate": "compute", "Lambda": "compute",
+    "Fargate": "compute",
+    "ALB": "network", "NLB": "network", "Route 53": "network", "CloudFront": "network",
+    "API Gateway": "network", "NAT Gateway": "network", "Transit Gateway": "network",
+    "VPC Endpoint": "network", "Network Firewall": "network", "WAF": "network",
+    "IGW": "network", "Internet Gateway": "network",
+    "RDS": "database", "Aurora": "database", "DynamoDB": "database",
+    "ElastiCache": "database", "Redshift": "database",
+    "S3": "storage", "EFS": "storage", "EBS": "storage",
+    "Cognito": "security", "IAM": "security", "KMS": "security",
+    "Secrets Manager": "security", "Shield": "security",
+    "CloudWatch": "management", "CloudTrail": "management",
+    "SQS": "management", "SNS": "management",
+}
+
+
+def _render_architecture_png(title: str, clusters: list, connections: list) -> bytes:
+    """Render architecture diagram using matplotlib."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import FancyBboxPatch
+    import io
+
+    all_services = {}
+    cluster_colors = ["#E3F2FD", "#E8F5E9", "#FFF3E0", "#F3E5F5", "#E0F2F1", "#FFF8E1", "#FCE4EC", "#EDE7F6"]
+    x_cursor = 0.5
+    cluster_boxes = []
+    for ci, cluster in enumerate(clusters):
+        services = cluster.get("services", [])
+        y_start = len(services) * 1.4 + 0.8
+        for si, svc in enumerate(services):
+            all_services[svc] = (x_cursor, y_start - si * 1.4 - 0.7)
+        cluster_boxes.append({"name": cluster["name"], "x": x_cursor,
+                               "y_top": y_start + 0.3, "y_bot": y_start - len(services) * 1.4 + 0.1,
+                               "color": cluster_colors[ci % len(cluster_colors)]})
+        x_cursor += 2.2
+
+    total_w = max(x_cursor + 0.5, 8)
+    total_h = max(max((len(c.get("services", [])) for c in clusters), default=3) * 1.4 + 2.0, 6)
+    fig, ax = plt.subplots(figsize=(max(total_w * 0.9, 10), max(total_h * 0.75, 6)))
+    ax.set_xlim(-0.5, total_w); ax.set_ylim(-0.5, total_h + 0.5); ax.axis("off")
+    fig.patch.set_facecolor("#F8FAFC"); ax.set_facecolor("#F8FAFC")
+    ax.text(total_w / 2, total_h + 0.1, title, ha="center", va="top", fontsize=14, fontweight="bold", color="#1A237E")
+
+    for cb in cluster_boxes:
+        ax.add_patch(FancyBboxPatch((cb["x"] - 0.9, cb["y_bot"] - 0.2), 1.8, cb["y_top"] - cb["y_bot"] + 0.2,
+                                    boxstyle="round,pad=0.1", linewidth=1.5, edgecolor="#90A4AE",
+                                    facecolor=cb["color"], alpha=0.6, zorder=1))
+        ax.text(cb["x"], cb["y_top"] + 0.05, cb["name"], ha="center", va="bottom",
+                fontsize=7.5, color="#37474F", fontweight="bold", style="italic")
+
+    for src, dst in connections:
+        if src in all_services and dst in all_services:
+            x1, y1 = all_services[src]; x2, y2 = all_services[dst]
+            ax.annotate("", xy=(x2, y2), xytext=(x1, y1),
+                        arrowprops=dict(arrowstyle="-|>", color="#546E7A", lw=1.4,
+                                        connectionstyle="arc3,rad=0.08"), zorder=2)
+
+    for svc, (x, y) in all_services.items():
+        colors = _AWS_COLORS.get(_SERVICE_CATEGORY.get(svc, "default"), _AWS_COLORS["default"])
+        ax.add_patch(FancyBboxPatch((x - 0.75, y - 0.38), 1.5, 0.76, boxstyle="round,pad=0.08",
+                                    linewidth=1.8, edgecolor=colors["border"], facecolor=colors["bg"], zorder=3))
+        label = svc if len(svc) <= 16 else svc.replace(" ", "\n", 1)
+        ax.text(x, y, label, ha="center", va="center", fontsize=7.5, fontweight="bold",
+                color=colors["text"], zorder=4, multialignment="center")
+
+    plt.tight_layout(pad=0.5)
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
 
 
 def _save_diagram_image(image_bytes: bytes, ext: str = "png") -> str | None:
