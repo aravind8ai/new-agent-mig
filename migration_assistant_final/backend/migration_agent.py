@@ -117,6 +117,11 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DIAGRAM_OUTPUT_DIR = Path(SCRIPT_DIR) / "generated-diagrams"
 DIAGRAM_OUTPUT_DIR.mkdir(exist_ok=True)
 
+# Ensure Graphviz binary is on PATH (Windows local dev)
+for _gv_path in [r"C:\Program Files\Graphviz\bin", r"C:\Program Files (x86)\Graphviz\bin"]:
+    if os.path.isdir(_gv_path) and _gv_path not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = os.environ["PATH"] + os.pathsep + _gv_path
+
 logger.info(f"[Config] DIAGRAM_BUCKET_NAME = {os.getenv('DIAGRAM_BUCKET_NAME', '<not set>')}")
 
 _ARCH_JSON_PROMPT = """\
@@ -354,38 +359,50 @@ def _render_with_diagrams_library(arch_json: dict) -> bytes | None:
     Returns PNG bytes or None if library unavailable.
     """
     try:
-        from diagrams import Diagram, Cluster, Edge
-        from diagrams.aws.compute import EC2, ECS, Lambda
+        from diagrams import Diagram, Cluster
+        from diagrams.aws.compute import EC2, ECS, Fargate, Lambda
         from diagrams.aws.network import (
             ALB, NLB, Route53, CloudFront, APIGateway,
-            NATGateway, TransitGateway, VPCEndpoint, NetworkFirewall,
-            InternetGateway,
+            NATGateway, TransitGateway, Endpoint, NetworkFirewall,
+            InternetGateway, IGW, TGW, VPC, PrivateSubnet, PublicSubnet,
         )
         from diagrams.aws.database import RDS, Aurora, Dynamodb, ElastiCache, Redshift
         from diagrams.aws.storage import S3, EFS, EBS
-        from diagrams.aws.security import Cognito, IAM, KMS, SecretsManager, Shield
+        from diagrams.aws.security import Cognito, IAM, KMS, SecretsManager, Shield, WAF
         from diagrams.aws.management import Cloudwatch, Cloudtrail, Config
         from diagrams.aws.integration import SQS, SNS
         import tempfile
     except ImportError:
         return None
 
-    # Map service names to diagrams classes
     SERVICE_MAP = {
-        "EC2": EC2, "ECS": ECS, "ECS Fargate": ECS, "Lambda": Lambda, "Fargate": ECS,
+        # Compute
+        "EC2": EC2, "ECS": ECS, "ECS Fargate": Fargate, "Fargate": Fargate,
+        "Lambda": Lambda, "Amazon EC2": EC2,
+        "Amazon EC2 (Public Subnet)": EC2, "Amazon EC2 (Private Subnet)": EC2,
+        # Network
         "ALB": ALB, "NLB": NLB, "Route 53": Route53, "CloudFront": CloudFront,
-        "API Gateway": APIGateway, "NAT Gateway": NATGateway,
-        "Transit Gateway": TransitGateway, "VPC Endpoint": VPCEndpoint,
-        "VPC Endpoint (S3)": VPCEndpoint, "VPC Endpoint (DynamoDB)": VPCEndpoint,
+        "API Gateway": APIGateway,
+        "NAT Gateway": NATGateway, "Transit Gateway": TransitGateway, "TGW": TGW,
+        "VPC Endpoint": Endpoint, "VPC Endpoint (S3)": Endpoint,
+        "VPC Endpoint (DynamoDB)": Endpoint, "Endpoint": Endpoint,
         "Network Firewall": NetworkFirewall, "AWS Network Firewall": NetworkFirewall,
-        "IGW": InternetGateway, "Internet Gateway": InternetGateway,
+        "IGW": IGW, "Internet Gateway": InternetGateway,
+        "VPC": VPC, "Amazon VPC": VPC,
+        "Public Subnet": PublicSubnet, "Private Subnet": PrivateSubnet,
+        "WAF": WAF,
+        # Database
         "RDS": RDS, "Aurora": Aurora, "DynamoDB": Dynamodb, "Dynamodb": Dynamodb,
         "ElastiCache": ElastiCache, "Redshift": Redshift,
+        # Storage
         "S3": S3, "EFS": EFS, "EBS": EBS,
-        "Cognito": Cognito, "IAM": IAM, "KMS": KMS, "Secrets Manager": SecretsManager,
-        "Shield": Shield,
+        # Security
+        "Cognito": Cognito, "IAM": IAM, "KMS": KMS,
+        "Secrets Manager": SecretsManager, "Shield": Shield,
+        # Management
         "CloudWatch": Cloudwatch, "Cloudwatch": Cloudwatch,
         "CloudTrail": Cloudtrail, "Config": Config,
+        # Integration
         "SQS": SQS, "SNS": SNS,
     }
 
@@ -395,30 +412,26 @@ def _render_with_diagrams_library(arch_json: dict) -> bytes | None:
             title = arch_json.get("title", "AWS Architecture")
             clusters = arch_json.get("clusters", [])
             connections = arch_json.get("connections", [])
-
-            # Build node registry
             nodes = {}
 
-            with Diagram(title, filename=str(output_path), show=False, direction="LR"):
+            with Diagram(title, filename=str(output_path), show=False,
+                         direction="LR", graph_attr={"dpi": "150"}):
                 for cluster_def in clusters:
-                    cluster_name = cluster_def.get("name", "Services")
                     services = cluster_def.get("services", [])
-
-                    with Cluster(cluster_name):
+                    if not services:
+                        continue
+                    with Cluster(cluster_def.get("name", "Services")):
                         for svc in services:
-                            # Find matching class or use generic EC2
                             svc_class = SERVICE_MAP.get(svc, EC2)
                             nodes[svc] = svc_class(svc)
 
-                # Create connections
                 for src, dst in connections:
                     if src in nodes and dst in nodes:
                         nodes[src] >> nodes[dst]
 
-            # Read generated PNG
             png_path = output_path.with_suffix(".png")
             if png_path.exists():
-                logger.info(f"[diagrams] Rendered with real AWS icons ({png_path.stat().st_size} bytes)")
+                logger.info(f"[diagrams] AWS icons rendered ({png_path.stat().st_size} bytes)")
                 return png_path.read_bytes()
 
     except Exception as e:
