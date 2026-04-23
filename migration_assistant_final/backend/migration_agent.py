@@ -116,6 +116,9 @@ def invoke_gateway_tool(tool_name: str, payload) -> str:
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DIAGRAM_OUTPUT_DIR = Path(SCRIPT_DIR) / "generated-diagrams"
 DIAGRAM_OUTPUT_DIR.mkdir(exist_ok=True)
+# Ensure the nginx-served diagrams dir exists in the container
+Path(SCRIPT_DIR) / "static" / "diagrams"
+(Path(SCRIPT_DIR) / "static" / "diagrams").mkdir(parents=True, exist_ok=True)
 
 # Ensure Graphviz binary is on PATH (Windows local dev)
 for _gv_path in [r"C:\Program Files\Graphviz\bin", r"C:\Program Files (x86)\Graphviz\bin"]:
@@ -257,7 +260,7 @@ def _save_diagram_image(image_bytes: bytes, ext: str = "png") -> str | None:
             url = s3.generate_presigned_url(
                 "get_object",
                 Params={"Bucket": bucket_name, "Key": s3_key},
-                ExpiresIn=3600,
+                ExpiresIn=86400,  # 24 hours
             )
             logger.info(f"[S3] Uploaded: s3://{bucket_name}/{s3_key}")
             return url
