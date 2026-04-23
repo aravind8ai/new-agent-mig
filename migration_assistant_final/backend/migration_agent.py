@@ -482,26 +482,34 @@ def invoke_bedrock_agent(prompt_text: str, session_id: str) -> str | None:
 # ---------------------------------------------------------------------------
 # Request classification helpers
 # ---------------------------------------------------------------------------
-_DIAGRAM_KEYWORDS = {
-    "diagram", "draw", "redraw", "architecture diagram", "architecture image",
-    "generate image", "flowchart", "visual", "aws icon", "icons", "png", "hld", "lld",
+# Any request containing these phrases goes directly to arch_diag_assistant
+_DIAGRAM_TRIGGERS = {
+    "diagram", "architecture diagram", "architecture design", "aws diagram",
+    "draw", "redraw", "flowchart", "visual", "aws icon", "icons",
+    "generate image", "architecture image", "hld", "lld", "png",
 }
 _GENERATION_VERBS = {
-    "generate", "create", "draw", "build", "produce", "show",
-    "modify", "update", "redraw", "revise", "enhance", "add", "convert", "make", "give me",
+    "generate", "create", "draw", "build", "produce", "show", "design",
+    "modify", "update", "redraw", "revise", "enhance", "add", "convert",
+    "make", "give me", "need", "want",
 }
 _DIAGRAM_NOUNS = {
-    "diagram", "architecture", "image", "visual", "flowchart", "png", "icon", "icons",
+    "diagram", "architecture", "image", "visual", "flowchart",
+    "png", "icon", "icons", "design",
 }
 
 
 def _is_diagram_request(text: str) -> bool:
     t = text.lower()
-    return any(k in t for k in _DIAGRAM_KEYWORDS)
+    return any(k in t for k in _DIAGRAM_TRIGGERS)
 
 
 def _is_diagram_generation_request(text: str) -> bool:
     t = text.lower()
+    # Direct trigger match — no verb required
+    if any(trigger in t for trigger in _DIAGRAM_TRIGGERS):
+        return True
+    # Verb + noun fallback
     return any(v in t for v in _GENERATION_VERBS) and any(n in t for n in _DIAGRAM_NOUNS)
 
 
