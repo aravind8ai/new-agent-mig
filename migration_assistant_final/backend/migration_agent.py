@@ -787,6 +787,9 @@ def _looks_like_diagram_refusal(text: str) -> bool:
 
 def invoke_local_migration_agent(prompt_text: str) -> str:
     """Run local Strands orchestration with both remote and local tools enabled."""
+    from strands.agent.conversation_manager import SlidingWindowConversationManager
+    from strands.types.exceptions import MaxTokensReachedException, ContextWindowOverflowException
+
     all_tools = [
         cost_assistant,
         aws_docs_assistant,
@@ -795,11 +798,28 @@ def invoke_local_migration_agent(prompt_text: str) -> str:
         arch_diag_assistant
     ]
     migration_agent = Agent(
-        model="us.amazon.nova-pro-v1:0",
+        model=BedrockModel(
+            model_id="us.amazon.nova-pro-v1:0",
+            max_tokens=4096,
+        ),
         system_prompt=migration_system_prompt,
-        tools=all_tools
+        tools=all_tools,
+        conversation_manager=SlidingWindowConversationManager(window_size=10),
     )
-    response = migration_agent(prompt_text)
+
+    try:
+        response = migration_agent(prompt_text)
+    except (MaxTokensReachedException, ContextWindowOverflowException):
+        logger.warning("Context window overflow — retrying with a fresh agent (no history).")
+        fresh_agent = Agent(
+            model=BedrockModel(
+                model_id="us.amazon.nova-pro-v1:0",
+                max_tokens=4096,
+            ),
+            system_prompt=migration_system_prompt,
+            tools=all_tools,
+        )
+        response = fresh_agent(prompt_text)
 
     content = response.message.get("content", []) if getattr(response, "message", None) else []
     text_parts = []
@@ -903,21 +923,21 @@ async def migration_assistant(payload):
     
     # 1. Retrieve History
     past_memories = get_memory(session_id)
-    if past_memories:
-        history_str = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in past_memories])
-        print(f"📄 Retrieved {len(past_memories)} past messages.")
-        
-        # Save original input for storage later
-        original_user_input = user_input
-        
-        # Prepend context to prompt
-        user_input = f"""Earlier Conversation History:
-{history_str}
+    # Save original input before any modification
+    original_user_input = user_input
 
-Current User Input:
-{user_input}"""
-    else:
-        original_user_input = user_input
+    if past_memories:
+        print(f"📄 Retrieved {len(past_memories)} past messages.")
+        # Build a concise context summary (last 3 exchanges max) to avoid token bloat
+        recent = past_memories[-6:]  # 3 user + 3 assistant turns
+        history_lines = []
+        for m in recent:
+            role_label = "User" if m["role"] == "user" else "Assistant"
+            # Truncate long assistant responses (e.g. diagrams) to avoid token explosion
+            content_snippet = m["content"][:400] + "..." if len(m["content"]) > 400 else m["content"]
+            history_lines.append(f"{role_label}: {content_snippet}")
+        history_str = "\n".join(history_lines)
+        user_input = f"[Recent conversation context]\n{history_str}\n\n[Current message]\n{user_input}"
         
     
     # Context Handling for Image
@@ -967,20 +987,25 @@ Current User Input:
             direct_diagram = await loop.run_in_executor(None, arch_diag_assistant, original_user_input)
             if direct_diagram:
                 response_text = direct_diagram
-        
+
         # 2. Save Interaction to Memory
         add_to_memory(session_id, "user", original_user_input)
         add_to_memory(session_id, "assistant", response_text)
-        
+
         return response_text
 
     except Exception as e:
+        from strands.types.exceptions import MaxTokensReachedException, ContextWindowOverflowException
+        if isinstance(e, (MaxTokensReachedException, ContextWindowOverflowException)):
+            logger.error("Max tokens reached at entrypoint level.")
+            return (
+                "I've reached the context limit for this conversation. "
+                "Please start a new session to continue."
+            )
         logger.error("CRITICAL ERROR IN AGENT:")
-        traceback.print_exc() 
-        # Write to file for debugging
+        traceback.print_exc()
         with open("error.log", "w") as f:
             f.write(traceback.format_exc())
-            
         return f"Server Error (Check Terminal Logs): {str(e)}"
 
 
