@@ -436,78 +436,138 @@ def _default_mermaid_template() -> str:
         'APP --> OBS["CloudWatch"]\n'
     )
 
-def _generate_mermaid_fallback_diagram(payload, failure_reason="") -> str:
-    """
-    Fallback path used when MCP/uvx diagram rendering is unavailable.
-    Generates Mermaid code with Nova and returns a hosted Mermaid image URL.
-    """
-    mermaid_code = ""
-    try:
-        bedrock_client = boto3.client(
-            "bedrock-runtime",
-            region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1")
-        )
-        prompt = f"""
-Create Mermaid syntax for an AWS architecture diagram.
-Return ONLY Mermaid code. No markdown fences. No explanation.
-Use flowchart LR.
+_DIAGRAMS_PROMPT = """You are an AWS Solutions Architect generating Python code using the `diagrams` library (https://diagrams.mingrammer.com).
+
+Generate a complete, runnable Python script that creates an AWS architecture diagram as a PNG file.
+
 Rules:
-- One statement per line.
-- Never place two node declarations on the same line unless connected by an arrow.
-- Use node IDs with letters/numbers/underscores only.
-- Prefer labels quoted in square brackets, for example: EC2_1["Web Server 1"].
+- Import ONLY from `diagrams`, `diagrams.aws.*`, and standard library modules.
+- Use `with Diagram("...", filename=OUTPUT_PATH, show=False, direction="LR"):` as the root context.
+- OUTPUT_PATH is already defined as a variable — do NOT redefine it.
+- Use real AWS service classes (e.g. `from diagrams.aws.compute import ECS, Lambda`, `from diagrams.aws.network import ALB, Route53`, `from diagrams.aws.database import RDS`, `from diagrams.aws.storage import S3`, `from diagrams.aws.security import Cognito`, `from diagrams.aws.management import Cloudwatch`).
+- Connect nodes with `>>` arrows.
+- Group related services inside `with Cluster("..."):` blocks.
+- Do NOT call `show()`, do NOT use `plt`, do NOT use subprocess.
+- Return ONLY the Python code block. No explanation.
 
 User request:
 {payload}
-""".strip()
+"""
 
+def _generate_diagrams_fallback(payload: str, failure_reason: str = "") -> str:
+    """
+    Fallback: asks Nova to write Python `diagrams` library code, executes it,
+    and returns the resulting PNG as a hosted image link.
+    """
+    import subprocess
+    import tempfile
+
+    bedrock_client = boto3.client(
+        "bedrock-runtime",
+        region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
+    )
+
+    code_text = ""
+    try:
         response = bedrock_client.invoke_model(
             modelId="us.amazon.nova-pro-v1:0",
             contentType="application/json",
             accept="application/json",
-            body=json.dumps(
-                {
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [{"text": prompt}]
-                        }
-                    ],
-                    "inferenceConfig": {"max_new_tokens": 900, "temperature": 0.2}
-                }
-            ),
+            body=json.dumps({
+                "messages": [{"role": "user", "content": [{"text": _DIAGRAMS_PROMPT.format(payload=payload)}]}],
+                "inferenceConfig": {"max_new_tokens": 1200, "temperature": 0.2},
+            }),
         )
         result = json.loads(response["body"].read())
-        text = (
-            result.get("output", {})
-            .get("message", {})
-            .get("content", [{}])[0]
-            .get("text", "")
-        )
-        mermaid_code = _extract_mermaid_code(text)
+        code_text = result.get("output", {}).get("message", {}).get("content", [{}])[0].get("text", "")
+        # Strip markdown fences if present
+        code_match = re.search(r"```(?:python)?\s*(.*?)```", code_text, re.DOTALL | re.IGNORECASE)
+        if code_match:
+            code_text = code_match.group(1).strip()
     except Exception as e:
-        logger.warning(f"Mermaid fallback generation via Nova failed: {e}")
+        logger.warning(f"Nova diagram code generation failed: {e}")
 
-    if not mermaid_code:
-        logger.warning("Generated Mermaid code failed validation. Using default template.")
-        mermaid_code = _default_mermaid_template()
+    img_url = None
+    if code_text:
+        try:
+            fname = f"diagram_{uuid4().hex[:8]}_{int(time.time())}"
+            with tempfile.TemporaryDirectory() as tmpdir:
+                output_path = os.path.join(tmpdir, fname)
+                # Inject OUTPUT_PATH variable before user code
+                full_code = f'OUTPUT_PATH = {repr(output_path)}\n\n{code_text}'
+                script_path = os.path.join(tmpdir, "gen_diagram.py")
+                with open(script_path, "w") as f:
+                    f.write(full_code)
 
+                result = subprocess.run(
+                    [sys.executable, script_path],
+                    capture_output=True, text=True, timeout=60,
+                    env={**os.environ, "MPLBACKEND": "Agg"},
+                )
+                if result.returncode != 0:
+                    logger.warning(f"diagrams script error: {result.stderr[:500]}")
+                else:
+                    png_path = output_path + ".png"
+                    if os.path.exists(png_path):
+                        with open(png_path, "rb") as f:
+                            image_bytes = f.read()
+                        img_url = _save_diagram_image(image_bytes, "png")
+        except Exception as e:
+            logger.warning(f"diagrams execution failed: {e}")
+
+    reason_prefix = f"_Primary renderer unavailable. Rendered with AWS icons via diagrams library._\n\n" if failure_reason else ""
+
+    if img_url:
+        return (
+            f"{reason_prefix}"
+            f"### Generated Architecture Diagram:\n\n"
+            f"![Architecture Diagram]({img_url})\n"
+        )
+
+    # Last resort: mermaid.ink
+    logger.warning("diagrams fallback failed, using mermaid.ink as last resort")
+    return _generate_mermaid_last_resort(payload, failure_reason)
+
+
+def _save_diagram_image(image_bytes: bytes, ext: str = "png") -> str | None:
+    """Saves image bytes to S3 or local static dir, returns URL."""
+    fname = f"diagram_{uuid4().hex[:8]}_{int(time.time())}.{ext}"
+    bucket_name = os.getenv("DIAGRAM_BUCKET_NAME")
+
+    if bucket_name:
+        try:
+            s3_client = boto3.client("s3")
+            s3_key = f"diagrams/{fname}"
+            s3_client.put_object(Bucket=bucket_name, Key=s3_key, Body=image_bytes, ContentType=f"image/{ext}")
+            return s3_client.generate_presigned_url("get_object", Params={"Bucket": bucket_name, "Key": s3_key}, ExpiresIn=3600)
+        except Exception as e:
+            logger.warning(f"S3 upload failed: {e}")
+
+    local_candidates = [
+        Path(SCRIPT_DIR) / "static" / "diagrams",
+        Path(SCRIPT_DIR).parent / "frontend" / "public" / "diagrams",
+    ]
+    for candidate in local_candidates:
+        if candidate.parent.exists():
+            candidate.mkdir(parents=True, exist_ok=True)
+            dest = candidate / fname
+            with open(dest, "wb") as f:
+                f.write(image_bytes)
+            return f"/diagrams/{fname}"
+
+    return None
+
+
+def _generate_mermaid_last_resort(payload: str, failure_reason: str = "") -> str:
+    """Absolute last resort: mermaid.ink hosted image."""
+    mermaid_code = _default_mermaid_template()
     encoded = base64.urlsafe_b64encode(mermaid_code.encode("utf-8")).decode("utf-8")
     mermaid_image_url = f"https://mermaid.ink/img/{encoded}"
-
-    reason_prefix = ""
-    if failure_reason:
-        reason_prefix = f"Native diagram renderer unavailable ({failure_reason}). Showing Mermaid fallback.\n\n"
-
+    reason_prefix = f"_Diagram renderer unavailable ({failure_reason})._\n\n" if failure_reason else ""
     return (
         f"{reason_prefix}"
         f"### Generated Architecture Diagram:\n\n"
-        f"![Architecture Diagram]({mermaid_image_url})\n\n"
-        "<details><summary>View Mermaid source</summary>\n\n"
-        "```mermaid\n"
-        f"{mermaid_code}\n"
-        "```\n"
-        "</details>"
+        f"![Architecture Diagram]({mermaid_image_url})\n"
     )
 
 @tool
@@ -567,63 +627,11 @@ def arch_diag_assistant(payload):
             # Extract Images
             text_parts = []
             saved_images = []
-            
-            # Cloud Storage Configuration
-            bucket_name = os.getenv("DIAGRAM_BUCKET_NAME")
-            s3_client = boto3.client('s3') if bucket_name else None
-            
+
             # Local fallback (for /tmp scanning)
             tmp_diagram_dir = Path("/tmp/generated-diagrams")
-            if not tmp_diagram_dir.exists(): 
-                 tmp_diagram_dir.mkdir(parents=True, exist_ok=True)
-
-            # Local fallback locations:
-            # 1) Container runtime: /app/static/diagrams (served by nginx root /app/static)
-            # 2) Local dev: ../frontend/public/diagrams (served by Vite static public directory)
-            local_diagram_dir = None
-            local_candidates = [
-                Path(SCRIPT_DIR) / "static" / "diagrams",
-                Path(SCRIPT_DIR).parent / "frontend" / "public" / "diagrams",
-            ]
-            for candidate in local_candidates:
-                if candidate.parent.exists():
-                    candidate.mkdir(parents=True, exist_ok=True)
-                    local_diagram_dir = candidate
-                    break
-
-            def save_generated_image(image_bytes, ext="png"):
-                fname = f"diagram_{uuid4().hex[:8]}_{int(time.time())}.{ext}"
-                
-                # 1. Upload to S3 (Priority for Cloud)
-                if bucket_name:
-                    try:
-                        s3_key = f"diagrams/{fname}"
-                        s3_client.put_object(
-                            Bucket=bucket_name,
-                            Key=s3_key,
-                            Body=image_bytes,
-                            ContentType=f"image/{ext}"
-                        )
-                        # Generate Presigned URL (valid for 1 hour)
-                        url = s3_client.generate_presigned_url(
-                            'get_object',
-                            Params={'Bucket': bucket_name, 'Key': s3_key},
-                            ExpiresIn=3600
-                        )
-                        print(f"[SUCCESS] Uploaded diagram to s3://{bucket_name}/{s3_key}")
-                        return url
-                    except Exception as e:
-                        print(f"[WARNING] Failed to upload to S3: {e}")
-                
-                # 2. Local Fallback
-                if local_diagram_dir:
-                    dest = local_diagram_dir / fname
-                    with open(dest, "wb") as f:
-                        f.write(image_bytes)
-                    print(f"[SUCCESS] Saved diagram locally to {dest}")
-                    return f"/diagrams/{fname}"
-                
-                return None
+            if not tmp_diagram_dir.exists():
+                tmp_diagram_dir.mkdir(parents=True, exist_ok=True)
 
             for part in response.message.get("content", []):
                 if not isinstance(part, dict):
@@ -631,7 +639,7 @@ def arch_diag_assistant(payload):
 
                 if part.get("type") == "text":
                     text_parts.append(part["text"])
-                
+
                 # Handle Base64 Image (if returned)
                 b64_data = part.get("data") or part.get("base64_data")
                 if b64_data:
@@ -640,23 +648,23 @@ def arch_diag_assistant(payload):
                         ext = (part.get("format") or "png").replace(".", "").lower()
                         if "/" in ext:
                             ext = ext.split("/")[-1]
-                        url = save_generated_image(image_bytes, ext)
+                        url = _save_diagram_image(image_bytes, ext)
                         if url:
                             saved_images.append(url)
                     except Exception as e:
                         print(f"Failed to process image data: {e}")
-            
+
             # CHECK TMP DIR (Hybrid Fallback)
             if tmp_diagram_dir.exists():
                 for tmp_file in tmp_diagram_dir.glob("*.png"):
                     try:
                         with open(tmp_file, "rb") as f:
                             image_bytes = f.read()
-                        
-                        url = save_generated_image(image_bytes, "png")
+
+                        url = _save_diagram_image(image_bytes, "png")
                         if url:
                             saved_images.append(url)
-                        
+
                         # Cleanup tmp
                         os.remove(tmp_file) 
                     except Exception as e:
@@ -671,8 +679,8 @@ def arch_diag_assistant(payload):
 
             raise RuntimeError("Diagram MCP tool completed but did not return any image bytes.")
     except Exception as e:
-        logger.warning(f"arch_diag_assistant failed, using Mermaid fallback: {e}")
-        return _generate_mermaid_fallback_diagram(payload, str(e))
+        logger.warning(f"arch_diag_assistant failed, using diagrams fallback: {e}")
+        return _generate_diagrams_fallback(payload, str(e))
 
 # --- Define Remote Tools Stubs ---
 # These look local to the Agent, but execute remotely.
