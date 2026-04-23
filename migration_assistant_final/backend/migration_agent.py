@@ -5,7 +5,6 @@ import time
 import logging
 import json
 import re
-import shutil
 import sys
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
@@ -13,13 +12,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from strands import Agent
-from strands.tools.mcp import MCPClient
-from mcp.client.streamable_http import streamablehttp_client
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 import uvicorn
 from strands.models import BedrockModel
-from bedrock_agentcore.memory import MemoryClient
-from strands.hooks import AgentInitializedEvent, HookProvider, MessageAddedEvent
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -439,16 +434,17 @@ def _default_mermaid_template() -> str:
 
 _DIAGRAMS_PROMPT = """You are an AWS Solutions Architect generating Python code using the `diagrams` library (https://diagrams.mingrammer.com).
 
-Generate a complete, runnable Python script that creates an AWS architecture diagram as a PNG file.
+Generate a complete, runnable Python script that creates ONE single AWS architecture diagram as a PNG file containing ALL services and components mentioned in the request.
 
 Rules:
 - Import ONLY from `diagrams`, `diagrams.aws.*`, and standard library modules.
-- Use `with Diagram("...", filename=OUTPUT_PATH, show=False, direction="LR"):` as the root context.
-- OUTPUT_PATH is already defined as a variable — do NOT redefine it.
-- Use real AWS service classes (e.g. `from diagrams.aws.compute import ECS, Lambda`, `from diagrams.aws.network import ALB, Route53`, `from diagrams.aws.database import RDS`, `from diagrams.aws.storage import S3`, `from diagrams.aws.security import Cognito`, `from diagrams.aws.management import Cloudwatch`).
+- Use EXACTLY ONE `with Diagram("...", filename=OUTPUT_PATH, show=False, direction="LR"):` block — never more than one.
+- OUTPUT_PATH is already defined as a variable — do NOT redefine it, do NOT hardcode any filename.
+- Include ALL services from the request inside this single Diagram block. Do NOT split into multiple diagrams.
+- Use real AWS service classes (e.g. `from diagrams.aws.compute import ECS, Lambda`, `from diagrams.aws.network import ALB, Route53`, `from diagrams.aws.database import RDS`, `from diagrams.aws.storage import S3`, `from diagrams.aws.security import Cognito`, `from diagrams.aws.management import Cloudwatch`, `from diagrams.aws.network import NATGateway, TransitGateway, VPCEndpoint`, `from diagrams.aws.network import Firewall`).
+- Group related services inside `with Cluster("..."):` blocks within the single Diagram.
 - Connect nodes with `>>` arrows.
-- Group related services inside `with Cluster("..."):` blocks.
-- Do NOT call `show()`, do NOT use `plt`, do NOT use subprocess.
+- Do NOT call `show()`, do NOT use `plt`, do NOT use subprocess, do NOT create more than one Diagram object.
 - Return ONLY the Python code block. No explanation.
 
 User request:
@@ -490,6 +486,13 @@ def _generate_diagrams_fallback(payload: str, failure_reason: str = "") -> str:
 
     img_url = None
     if code_text:
+        # Safety: if Nova generated multiple Diagram() calls, keep only the first block
+        diagram_matches = list(re.finditer(r'with Diagram\(', code_text))
+        if len(diagram_matches) > 1:
+            logger.warning(f"Nova generated {len(diagram_matches)} Diagram blocks — truncating to first only.")
+            second_start = diagram_matches[1].start()
+            code_text = code_text[:second_start].rstrip()
+
         try:
             fname = f"diagram_{uuid4().hex[:8]}_{int(time.time())}"
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -591,113 +594,10 @@ def _generate_mermaid_last_resort(payload: str, failure_reason: str = "") -> str
 def arch_diag_assistant(payload):
     """
     A Senior AWS Solutions Architect specializing in architecture diagrams.
-    Creates PNG architecture diagrams using AWS Diagram MCP server.
+    Creates PNG architecture diagrams using the diagrams library with real AWS service icons.
     """
     print(f"arch_diag_assistant called with payload: {payload}")
-    try:
-        uvx_path = shutil.which("uvx")
-        if uvx_path:
-            diagram_command = uvx_path
-            diagram_args = [
-                "--with", "jschema-to-python",
-                "awslabs.aws-diagram-mcp-server@latest"
-            ]
-        else:
-            try:
-                import uv  # noqa: F401
-                diagram_command = sys.executable
-                diagram_args = [
-                    "-m", "uv", "tool", "run",
-                    "--with", "jschema-to-python",
-                    "awslabs.aws-diagram-mcp-server@latest"
-                ]
-            except Exception:
-                raise RuntimeError("uvx binary not found in runtime and `uv` module is unavailable")
-
-        diagram_mcp_client = MCPClient(
-            lambda: stdio_client(
-                StdioServerParameters(
-                    command=diagram_command,
-                    args=diagram_args
-                )
-            )
-        )
-        
-        print("Initializing architecture diagram agent...")
-        
-        with diagram_mcp_client:
-            diagram_tools = diagram_mcp_client.list_tools_sync()
-            
-            agent = Agent(
-                model="us.amazon.nova-pro-v1:0",
-                tools=diagram_tools,
-                system_prompt="""You are a Senior AWS Solutions Architect.
-                Create professional AWS architecture diagrams.
-                - Use generate_diagram tool ONCE.
-                - Follow AWS Well-Architected Framework.
-                - Generate only ONE diagram per request.
-                """
-            )
-            
-            response = agent(payload)
-            
-            # Extract Images
-            text_parts = []
-            saved_images = []
-
-            # Local fallback (for /tmp scanning)
-            tmp_diagram_dir = Path("/tmp/generated-diagrams")
-            if not tmp_diagram_dir.exists():
-                tmp_diagram_dir.mkdir(parents=True, exist_ok=True)
-
-            for part in response.message.get("content", []):
-                if not isinstance(part, dict):
-                    continue
-
-                if part.get("type") == "text":
-                    text_parts.append(part["text"])
-
-                # Handle Base64 Image (if returned)
-                b64_data = part.get("data") or part.get("base64_data")
-                if b64_data:
-                    try:
-                        image_bytes = base64.b64decode(b64_data)
-                        ext = (part.get("format") or "png").replace(".", "").lower()
-                        if "/" in ext:
-                            ext = ext.split("/")[-1]
-                        url = _save_diagram_image(image_bytes, ext)
-                        if url:
-                            saved_images.append(url)
-                    except Exception as e:
-                        print(f"Failed to process image data: {e}")
-
-            # CHECK TMP DIR (Hybrid Fallback)
-            if tmp_diagram_dir.exists():
-                for tmp_file in tmp_diagram_dir.glob("*.png"):
-                    try:
-                        with open(tmp_file, "rb") as f:
-                            image_bytes = f.read()
-
-                        url = _save_diagram_image(image_bytes, "png")
-                        if url:
-                            saved_images.append(url)
-
-                        # Cleanup tmp
-                        os.remove(tmp_file) 
-                    except Exception as e:
-                        print(f"Failed to process tmp file {tmp_file}: {e}")
-
-            result = "\n\n".join(text_parts).strip()
-            if saved_images:
-                result += "\n\n### Generated Architecture Diagram:\n"
-                for img_path in saved_images:
-                   result += f"\n![Architecture Diagram]({img_path})\n"
-                return result
-
-            raise RuntimeError("Diagram MCP tool completed but did not return any image bytes.")
-    except Exception as e:
-        logger.warning(f"arch_diag_assistant failed, using diagrams fallback: {e}")
-        return _generate_diagrams_fallback(payload, str(e))
+    return _generate_diagrams_fallback(payload)
 
 # --- Define Remote Tools Stubs ---
 # These look local to the Agent, but execute remotely.
