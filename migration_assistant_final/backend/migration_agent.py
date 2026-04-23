@@ -276,8 +276,8 @@ def _save_diagram_image(image_bytes: bytes, ext: str = "png") -> str | None:
 
 def _generate_diagram(payload: str) -> str:
     """
-    Ask Nova Pro to extract architecture as JSON, render with matplotlib, save to S3.
-    Returns markdown image link or error message.
+    Ask Nova Pro to extract architecture as JSON, render with diagrams library (preferred)
+    or matplotlib (fallback), save to S3. Returns markdown image link or error message.
     """
     bedrock = boto3.client("bedrock-runtime",
                            region_name=os.getenv("AWS_DEFAULT_REGION", "us-east-1"))
@@ -297,28 +297,134 @@ def _generate_diagram(payload: str) -> str:
         text = (json.loads(resp["body"].read())
                 .get("output", {}).get("message", {})
                 .get("content", [{}])[0].get("text", ""))
-        json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-        arch_json = json.loads(json_match.group(1) if json_match else text.strip())
+        logger.info(f"[diagram] Nova response ({len(text)} chars)")
+
+        # Strategy 1: fenced ```json ... ``` block
+        m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
+        if m:
+            arch_json = json.loads(m.group(1))
+        else:
+            # Strategy 2: find the outermost { ... } block
+            for start_m in reversed(list(re.finditer(r"\{", text))):
+                start = start_m.start()
+                depth = 0
+                for i, ch in enumerate(text[start:]):
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            arch_json = json.loads(text[start:start + i + 1])
+                            break
+                if arch_json:
+                    break
+
         logger.info(f"[diagram] {len(arch_json.get('clusters', []))} clusters, "
                     f"{len(arch_json.get('connections', []))} connections")
     except Exception as e:
         logger.warning(f"[diagram] JSON extraction failed: {e}")
 
     if arch_json:
-        try:
-            image_bytes = _render_architecture_png(
-                title=arch_json.get("title", "AWS Architecture"),
-                clusters=arch_json.get("clusters", []),
-                connections=arch_json.get("connections", []),
-            )
+        # Try diagrams library first (real AWS icons), fall back to matplotlib
+        image_bytes = _render_with_diagrams_library(arch_json)
+        if not image_bytes:
+            logger.info("[diagram] diagrams library unavailable — using matplotlib fallback")
+            try:
+                image_bytes = _render_architecture_png(
+                    title=arch_json.get("title", "AWS Architecture"),
+                    clusters=arch_json.get("clusters", []),
+                    connections=arch_json.get("connections", []),
+                )
+            except Exception as e:
+                logger.warning(f"[diagram] matplotlib render failed: {e}")
+                image_bytes = None
+
+        if image_bytes:
             img_url = _save_diagram_image(image_bytes, "png")
             if img_url:
                 return f"### Generated Architecture Diagram:\n\n![Architecture Diagram]({img_url})\n"
-        except Exception as e:
-            logger.warning(f"[diagram] Render failed: {e}")
 
     logger.warning("[diagram] Diagram generation failed — no image produced.")
     return "I was unable to generate the diagram. Please try again with more details about the architecture."
+
+
+def _render_with_diagrams_library(arch_json: dict) -> bytes | None:
+    """
+    Render using the `diagrams` library with real AWS service icons.
+    Returns PNG bytes or None if library unavailable.
+    """
+    try:
+        from diagrams import Diagram, Cluster, Edge
+        from diagrams.aws.compute import EC2, ECS, Lambda
+        from diagrams.aws.network import (
+            ALB, NLB, Route53, CloudFront, APIGateway,
+            NATGateway, TransitGateway, VPCEndpoint, NetworkFirewall,
+            InternetGateway,
+        )
+        from diagrams.aws.database import RDS, Aurora, Dynamodb, ElastiCache, Redshift
+        from diagrams.aws.storage import S3, EFS, EBS
+        from diagrams.aws.security import Cognito, IAM, KMS, SecretsManager, Shield
+        from diagrams.aws.management import Cloudwatch, Cloudtrail, Config
+        from diagrams.aws.integration import SQS, SNS
+        import tempfile
+    except ImportError:
+        return None
+
+    # Map service names to diagrams classes
+    SERVICE_MAP = {
+        "EC2": EC2, "ECS": ECS, "ECS Fargate": ECS, "Lambda": Lambda, "Fargate": ECS,
+        "ALB": ALB, "NLB": NLB, "Route 53": Route53, "CloudFront": CloudFront,
+        "API Gateway": APIGateway, "NAT Gateway": NATGateway,
+        "Transit Gateway": TransitGateway, "VPC Endpoint": VPCEndpoint,
+        "VPC Endpoint (S3)": VPCEndpoint, "VPC Endpoint (DynamoDB)": VPCEndpoint,
+        "Network Firewall": NetworkFirewall, "AWS Network Firewall": NetworkFirewall,
+        "IGW": InternetGateway, "Internet Gateway": InternetGateway,
+        "RDS": RDS, "Aurora": Aurora, "DynamoDB": Dynamodb, "Dynamodb": Dynamodb,
+        "ElastiCache": ElastiCache, "Redshift": Redshift,
+        "S3": S3, "EFS": EFS, "EBS": EBS,
+        "Cognito": Cognito, "IAM": IAM, "KMS": KMS, "Secrets Manager": SecretsManager,
+        "Shield": Shield,
+        "CloudWatch": Cloudwatch, "Cloudwatch": Cloudwatch,
+        "CloudTrail": Cloudtrail, "Config": Config,
+        "SQS": SQS, "SNS": SNS,
+    }
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "diagram"
+            title = arch_json.get("title", "AWS Architecture")
+            clusters = arch_json.get("clusters", [])
+            connections = arch_json.get("connections", [])
+
+            # Build node registry
+            nodes = {}
+
+            with Diagram(title, filename=str(output_path), show=False, direction="LR"):
+                for cluster_def in clusters:
+                    cluster_name = cluster_def.get("name", "Services")
+                    services = cluster_def.get("services", [])
+
+                    with Cluster(cluster_name):
+                        for svc in services:
+                            # Find matching class or use generic EC2
+                            svc_class = SERVICE_MAP.get(svc, EC2)
+                            nodes[svc] = svc_class(svc)
+
+                # Create connections
+                for src, dst in connections:
+                    if src in nodes and dst in nodes:
+                        nodes[src] >> nodes[dst]
+
+            # Read generated PNG
+            png_path = output_path.with_suffix(".png")
+            if png_path.exists():
+                logger.info(f"[diagrams] Rendered with real AWS icons ({png_path.stat().st_size} bytes)")
+                return png_path.read_bytes()
+
+    except Exception as e:
+        logger.warning(f"[diagrams] Render failed: {e}")
+
+    return None
 
 
 # ---------------------------------------------------------------------------
