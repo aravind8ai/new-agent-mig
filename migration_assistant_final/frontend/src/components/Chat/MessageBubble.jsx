@@ -4,17 +4,34 @@ import { Bot, User, Download } from 'lucide-react';
 
 // Custom Image Renderer with Download Button
 const ImageRenderer = ({ src, alt }) => {
+    const handleDownload = async () => {
+        try {
+            const response = await fetch(src);
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `architecture-diagram-${Date.now()}.png`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        } catch {
+            // Fallback: open in new tab
+            window.open(src, '_blank');
+        }
+    };
+
     return (
         <div className="diagram-container">
             <img src={src} alt={alt || 'Architecture Diagram'} className="diagram-image" />
-            <a
-                href={src}
-                download
+            <button
+                onClick={handleDownload}
                 className="download-btn"
                 title="Download diagram"
             >
                 <Download size={16} /> Download
-            </a>
+            </button>
         </div>
     );
 };
@@ -143,6 +160,7 @@ const MessageBubble = ({ role, content }) => {
           padding: 8px 16px;
           background: var(--accent-gradient);
           color: white;
+          border: none;
           border-radius: 6px;
           text-decoration: none;
           font-size: 0.9rem;

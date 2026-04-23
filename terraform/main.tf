@@ -140,6 +140,17 @@ resource "aws_s3_bucket_public_access_block" "diagrams" {
   restrict_public_buckets = true
 }
 
+resource "aws_s3_bucket_cors_configuration" "diagrams" {
+  bucket = aws_s3_bucket.diagrams.id
+
+  cors_rule {
+    allowed_headers = ["*"]
+    allowed_methods = ["GET"]
+    allowed_origins = ["*"]
+    max_age_seconds = 3600
+  }
+}
+
 resource "aws_s3_bucket_lifecycle_configuration" "diagrams" {
   bucket = aws_s3_bucket.diagrams.id
 
