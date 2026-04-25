@@ -45,7 +45,7 @@ locals {
   target_group_name   = substr("${local.app_name}-tg", 0, 32)
   alb_name            = substr("${local.app_name}-alb", 0, 32)
   image_uri           = "${aws_ecr_repository.app.repository_url}:${var.container_image_tag}"
-  lambda_source_file  = "${path.module}/../migration_assistant_final/backend/tools_lambda.py"
+  lambda_source_file  = "${path.module}/../mig_assist/backend/tools_lambda.py"
   lambda_output_zip   = "${path.module}/tools_lambda.zip"
   bedrock_tools_openapi_schema = jsonencode({
     openapi = "3.0.1"

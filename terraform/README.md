@@ -33,7 +33,7 @@ terraform apply
 After apply, push the app image to ECR (use output `ecr_repository_url`) and trigger deployment:
 
 ```bash
-cd ../migration_assistant_final
+cd ../mig_assist
 ./deploy.sh
 ```
 
@@ -47,4 +47,4 @@ Access the app using output `app_url` (ALB DNS over HTTP).
 - No default VPC is required; Terraform creates and manages networking for this stack.
 - No ACM certificate and no Route53 records are created.
 - Bedrock Agent creation is controlled by `create_bedrock_agent`.
-- Lambda code is packaged from `../migration_assistant_final/backend/tools_lambda.py`.
+- Lambda code is packaged from `../mig_assist/backend/tools_lambda.py`.

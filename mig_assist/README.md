@@ -123,7 +123,7 @@ Key outputs after apply:
 
 ### Step 3 — Build and deploy the application
 
-Create `migration_assistant_final/.env`:
+Create `mig_assist/.env`:
 
 ```env
 APP_NAME=migration-agent-cloud
@@ -134,13 +134,13 @@ DESIRED_COUNT=1
 
 **Windows (PowerShell):**
 ```powershell
-cd migration_assistant_final
+cd mig_assist
 .\deploy.ps1
 ```
 
 **Linux / Mac:**
 ```bash
-cd migration_assistant_final
+cd mig_assist
 ./deploy.sh
 ```
 
@@ -197,7 +197,7 @@ Open the URL in a browser. Allow 2–3 minutes for the ECS task to stabilise aft
 ## Project Structure
 
 ```
-migration_assistant_final/
+mig_assist/
 ├── backend/
 │   ├── migration_agent.py      # Main agent — routing, tools, diagram generation
 │   ├── tools_lambda.py         # Lambda: cost, docs, subnet calculator tools

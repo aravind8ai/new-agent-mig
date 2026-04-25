@@ -60,3 +60,14 @@ migration_agent/chat_histories/
 migration_agent/generated-diagrams/
 node_modules/
 
+
+# Generated diagram output dirs
+mig_assist/backend/generated-diagrams/
+mig_assist/frontend/public/diagrams/
+
+# Test artifacts
+test_*.png
+test_*.py
+
+# AWS CLI installer bundle
+aws/

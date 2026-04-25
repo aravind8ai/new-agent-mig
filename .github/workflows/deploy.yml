@@ -7,7 +7,7 @@ on:
       - main
     paths:
       - 'terraform/**'
-      - 'migration_assistant_final/**'
+      - 'mig_assist/**'
       - '.github/workflows/deploy.yml'
 
 permissions:
@@ -60,7 +60,7 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build and push Docker image
-        working-directory: migration_assistant_final
+        working-directory: mig_assist
         env:
           IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
           VITE_APP_TITLE: ${{ vars.APP_TITLE || 'AWS Migration Assistant' }}
